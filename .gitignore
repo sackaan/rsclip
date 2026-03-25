@@ -1,0 +1,15 @@
+# Build artifacts
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+*.lnk
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

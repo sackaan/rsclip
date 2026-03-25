@@ -1,0 +1,79 @@
+[package]
+name = "rsclip"
+version = "0.1.0"
+edition = "2021"
+description = "Instant replay tool for RuneLite (Old School RuneScape)"
+license = "GPL-3.0-only"
+repository = "https://github.com/cowmilker42/RSClip"
+readme = "README.md"
+keywords = ["osrs", "runelite", "replay", "screen-capture", "windows"]
+categories = ["multimedia::video", "games"]
+
+[dependencies]
+# GUI
+eframe = { version = "0.31", features = ["persistence"] }
+egui = "0.31"
+
+# Serialization (for persistence)
+serde = { version = "1", features = ["derive"] }
+
+# Windows APIs (Graphics Capture, Win32)
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_Threading",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Graphics",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Graphics_Dwm",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+# Concurrency
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Global hotkeys
+global-hotkey = "0.6"
+
+# Image handling
+image = "0.25"
+
+# Error handling
+anyhow = "1.0"
+
+# Time
+chrono = "0.4"
+
+# Logging
+log = "0.4"
+
+# Open file explorer
+open = "5"
+
+# OS directory paths
+dirs = "6"
+
+# Native file dialog
+rfd = "0.15"
+
+[build-dependencies]
+winresource = "0.1"
+image = "0.25"
+ico = "0.3"
