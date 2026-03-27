@@ -291,6 +291,61 @@ struct SrcFormat {
     block_align: u16,
 }
 
+/// Stateful linear resampler that carries the fractional sample position
+/// across chunk boundaries. Without this, each chunk independently truncates
+/// the fractional part, losing up to one output sample per chunk. Over long
+/// sessions (100 chunks/sec * hours) this drift becomes audible — the same
+/// class of bug OBS avoids by using persistent resampler state.
+struct ResamplerState {
+    frac: f64,
+}
+
+impl ResamplerState {
+    fn new() -> Self {
+        Self { frac: 0.0 }
+    }
+
+    fn resample(&mut self, input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+        if src_rate == dst_rate {
+            return input.to_vec();
+        }
+
+        let src_frames = input.len() / 2;
+        if src_frames == 0 {
+            return Vec::new();
+        }
+
+        let ratio = src_rate as f64 / dst_rate as f64;
+        let mut out = Vec::new();
+        let mut src_pos = self.frac;
+
+        while (src_pos as usize) < src_frames {
+            let idx = src_pos as usize;
+            let frac = (src_pos - idx as f64) as f32;
+
+            let idx0 = idx.min(src_frames - 1);
+            let idx1 = (idx + 1).min(src_frames - 1);
+
+            // Left channel
+            let l0 = input[idx0 * 2];
+            let l1 = input[idx1 * 2];
+            out.push(l0 + (l1 - l0) * frac);
+
+            // Right channel
+            let r0 = input[idx0 * 2 + 1];
+            let r1 = input[idx1 * 2 + 1];
+            out.push(r0 + (r1 - r0) * frac);
+
+            src_pos += ratio;
+        }
+
+        // Carry the fractional remainder to the next call.
+        self.frac = src_pos - src_frames as f64;
+
+        out
+    }
+}
+
 /// WASAPI capture loop for a microphone. Converts to 48 kHz stereo f32.
 pub(super) unsafe fn device_capture_loop(
     running: &AtomicBool,
@@ -358,6 +413,8 @@ pub(super) unsafe fn device_capture_loop(
 
     info!("Mic capture started");
 
+    let mut resampler = ResamplerState::new();
+
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(10));
 
@@ -389,7 +446,8 @@ pub(super) unsafe fn device_capture_loop(
                 buffer.lock().push_silence(canonical_bytes);
             } else if !data_ptr.is_null() && byte_count > 0 {
                 let slice = std::slice::from_raw_parts(data_ptr, byte_count);
-                let converted = convert_to_canonical(slice, num_frames, &src_format);
+                let converted =
+                    convert_to_canonical(slice, num_frames, &src_format, &mut resampler);
                 buffer.lock().push(&converted);
             }
 
@@ -403,13 +461,18 @@ pub(super) unsafe fn device_capture_loop(
 }
 
 /// Convert raw PCM from the source format to canonical 48 kHz stereo f32.
-fn convert_to_canonical(data: &[u8], num_frames: u32, src: &SrcFormat) -> Vec<u8> {
+fn convert_to_canonical(
+    data: &[u8],
+    num_frames: u32,
+    src: &SrcFormat,
+    resampler: &mut ResamplerState,
+) -> Vec<u8> {
     let src_samples = decode_to_f32(data, num_frames, src);
     let stereo = to_stereo(&src_samples, src.channels, num_frames as usize);
     let resampled = if src.sample_rate == 48000 {
         stereo
     } else {
-        resample_linear(&stereo, src.sample_rate, 48000)
+        resampler.resample(&stereo, src.sample_rate, 48000)
     };
 
     let mut out = Vec::with_capacity(resampled.len() * 4);
@@ -476,39 +539,3 @@ fn to_stereo(samples: &[f32], src_channels: u16, num_frames: usize) -> Vec<f32> 
     out
 }
 
-fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate {
-        return input.to_vec();
-    }
-
-    let src_frames = input.len() / 2;
-    if src_frames == 0 {
-        return Vec::new();
-    }
-
-    let dst_frames = ((src_frames as u64 * dst_rate as u64) / src_rate as u64) as usize;
-    let mut out = Vec::with_capacity(dst_frames * 2);
-
-    let ratio = src_rate as f64 / dst_rate as f64;
-    for i in 0..dst_frames {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f64;
-        let frac = frac as f32;
-
-        let idx0 = idx.min(src_frames - 1);
-        let idx1 = (idx + 1).min(src_frames - 1);
-
-        // Left channel
-        let l0 = input[idx0 * 2];
-        let l1 = input[idx1 * 2];
-        out.push(l0 + (l1 - l0) * frac);
-
-        // Right channel
-        let r0 = input[idx0 * 2 + 1];
-        let r1 = input[idx1 * 2 + 1];
-        out.push(r0 + (r1 - r0) * frac);
-    }
-
-    out
-}

@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use log::{info, warn};
@@ -26,6 +27,13 @@ pub(super) struct AudioRingBuffer {
     bits_per_sample: u16,
     block_align: u16,
     is_float: bool,
+    /// Monotonic count of all bytes ever pushed (including silence).
+    /// Used with `capture_start` to compute the effective byte rate,
+    /// compensating for audio hardware clock drift — the same approach
+    /// OBS uses (sample-count based timing instead of system clock).
+    total_bytes_written: u64,
+    /// Wall-clock instant when the first audio data arrived.
+    capture_start: Option<Instant>,
 }
 
 impl AudioRingBuffer {
@@ -50,7 +58,28 @@ impl AudioRingBuffer {
             bits_per_sample,
             block_align,
             is_float,
+            total_bytes_written: 0,
+            capture_start: None,
         }
+    }
+
+    /// Effective byte rate derived from actual capture timing.
+    ///
+    /// Audio hardware clocks drift from their nominal rate (e.g. a "48 kHz"
+    /// device might actually run at 47 999 Hz). Over long sessions this causes
+    /// audio/video desync. By dividing the total bytes the hardware delivered
+    /// by the wall-clock time elapsed we get the *real* rate, which we then
+    /// use when extracting a time-based snapshot from the ring buffer.
+    fn effective_bytes_per_sec(&self) -> f64 {
+        let nominal = self.sample_rate as f64 * self.block_align as f64;
+        if let Some(start) = self.capture_start {
+            let elapsed = start.elapsed().as_secs_f64();
+            // Only trust the measurement after enough data has accumulated.
+            if elapsed >= 1.0 && self.total_bytes_written > nominal as u64 {
+                return self.total_bytes_written as f64 / elapsed;
+            }
+        }
+        nominal
     }
 
     pub(super) fn push(&mut self, pcm: &[u8]) {
@@ -58,6 +87,11 @@ impl AudioRingBuffer {
         if cap == 0 || pcm.is_empty() {
             return;
         }
+
+        if self.capture_start.is_none() {
+            self.capture_start = Some(Instant::now());
+        }
+        self.total_bytes_written += pcm.len() as u64;
 
         let len = pcm.len();
         if len >= cap {
@@ -85,6 +119,11 @@ impl AudioRingBuffer {
             return;
         }
 
+        if self.capture_start.is_none() {
+            self.capture_start = Some(Instant::now());
+        }
+        self.total_bytes_written += count as u64;
+
         let len = count.min(cap);
         let space_to_end = cap - self.write_pos;
         if len <= space_to_end {
@@ -102,8 +141,8 @@ impl AudioRingBuffer {
             return Vec::new();
         }
 
-        let bytes_per_sec = self.sample_rate as usize * self.block_align as usize;
-        let requested = (seconds * bytes_per_sec as f64) as usize;
+        let bytes_per_sec = self.effective_bytes_per_sec();
+        let requested = (seconds * bytes_per_sec) as usize;
         let available = requested.min(self.filled);
         let available = (available / self.block_align as usize) * self.block_align as usize;
         if available == 0 {
@@ -137,8 +176,8 @@ impl AudioRingBuffer {
             return Vec::new();
         }
 
-        let bytes_per_sec = self.sample_rate as usize * self.block_align as usize;
-        let requested = (seconds * bytes_per_sec as f64) as usize;
+        let bytes_per_sec = self.effective_bytes_per_sec();
+        let requested = (seconds * bytes_per_sec) as usize;
         let available = requested.min(self.filled);
         let available = (available / self.block_align as usize) * self.block_align as usize;
         if available == 0 {
