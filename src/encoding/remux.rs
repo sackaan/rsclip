@@ -1,3 +1,7 @@
+//! Save-time remux from the encoded MPEG-TS ring + mixed WAV into a final
+//! MP4. Stream-copy on video (no re-encode); the audio track is encoded to
+//! AAC.
+
 use std::path::Path;
 use std::process::Stdio;
 

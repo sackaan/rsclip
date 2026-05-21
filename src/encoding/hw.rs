@@ -1,3 +1,5 @@
+//! Hardware encoder selection and FFmpeg invocation helpers.
+
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
@@ -27,16 +29,21 @@ pub(crate) fn ffmpeg_cmd() -> Command {
     cmd
 }
 
-/// Which hardware encoder to attempt.
+/// Which H.264 encoder to drive FFmpeg with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwEncoder {
+    /// NVIDIA NVENC (`h264_nvenc`).
     Nvenc,
+    /// Intel QuickSync (`h264_qsv`).
     Qsv,
+    /// AMD AMF (`h264_amf`).
     Amf,
+    /// libx264 software fallback.
     Software,
 }
 
 impl HwEncoder {
+    /// Human-friendly short name (shown in the GUI status bar).
     pub fn display_name(&self) -> &'static str {
         match self {
             HwEncoder::Nvenc => "NVENC",
@@ -46,6 +53,7 @@ impl HwEncoder {
         }
     }
 
+    /// FFmpeg codec name (`-c:v` value).
     pub fn codec_name(&self) -> &'static str {
         match self {
             HwEncoder::Nvenc => "h264_nvenc",
@@ -55,6 +63,8 @@ impl HwEncoder {
         }
     }
 
+    /// FFmpeg pixel format expected on output (QSV wants NV12; the rest are
+    /// happy with YUV420P).
     pub fn pix_fmt(&self) -> &'static str {
         match self {
             HwEncoder::Qsv => "nv12",
@@ -62,6 +72,7 @@ impl HwEncoder {
         }
     }
 
+    /// Build the rate-control + quality argv fragment for this encoder.
     pub fn quality_args(
         &self,
         rate_control: RateControl,
@@ -113,6 +124,14 @@ impl HwEncoder {
     }
 }
 
+impl std::fmt::Display for HwEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+/// Probe NVENC / QSV / AMF in that order; return the first that succeeds,
+/// otherwise [`HwEncoder::Software`].
 pub fn detect_best_encoder() -> HwEncoder {
     for enc in &[HwEncoder::Nvenc, HwEncoder::Qsv, HwEncoder::Amf] {
         if probe_encoder(enc.codec_name()) {
@@ -124,6 +143,7 @@ pub fn detect_best_encoder() -> HwEncoder {
     HwEncoder::Software
 }
 
+/// Whether `ffmpeg -version` succeeds (FFmpeg is on PATH or beside the .exe).
 pub fn is_ffmpeg_available() -> bool {
     ffmpeg_cmd()
         .arg("-version")

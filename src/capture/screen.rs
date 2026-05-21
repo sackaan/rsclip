@@ -1,7 +1,11 @@
-// Screen capture via the Windows Graphics Capture API.
-//
-// Captures the RuneLite window by HWND. Frames are pushed to the encoder
-// pipeline via a channel from the WGC FrameArrived callback.
+//! Screen capture via the Windows Graphics Capture API.
+//!
+//! [`start_capture`] takes a window handle and forwards each captured frame
+//! to the encoder over a [`crossbeam_channel::Sender`]. The `FrameArrived`
+//! callback runs on a WGC-owned thread; we copy the GPU texture to a
+//! staging texture, map it, optionally crop, and try to push the resulting
+//! [`RawFrame`]. If the channel is full the frame is counted as dropped
+//! rather than blocking the capture thread.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -94,7 +98,7 @@ pub fn start_capture(
     let session = frame_pool.CreateCaptureSession(&item)?;
 
     // Try to hide the yellow capture border (Windows 11+, silently ignored on older builds).
-    let _ = set_border_required_false(&session);
+    let _ = session.SetIsBorderRequired(false);
 
     // --- Shared state for the event handler ---
     let running_clone = running.clone();
@@ -174,7 +178,9 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         )
         .context("D3D11CreateDevice failed")?;
     }
-    Ok((device.unwrap(), context.unwrap()))
+    let device = device.context("D3D11CreateDevice returned a null device")?;
+    let context = context.context("D3D11CreateDevice returned a null context")?;
+    Ok((device, context))
 }
 
 /// Create a GraphicsCaptureItem from a window handle.
@@ -312,9 +318,4 @@ fn read_mapped_region(
     }
 
     (dst, w, h)
-}
-
-fn set_border_required_false(session: &GraphicsCaptureSession) -> Result<()> {
-    session.SetIsBorderRequired(false)?;
-    Ok(())
 }

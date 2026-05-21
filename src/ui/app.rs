@@ -25,6 +25,10 @@ pub(super) enum Screen {
     Settings,
 }
 
+/// Top-level GUI state. Implements [`eframe::App`].
+///
+/// Fields are visible only inside the [`crate::ui`] module tree; the rest of
+/// the crate interacts with the app through the [`eframe::App`] trait.
 pub struct ClipperApp {
     pub(super) settings: Settings,
 
@@ -62,6 +66,8 @@ pub struct ClipperApp {
 }
 
 impl ClipperApp {
+    /// Construct the app: load persisted settings, install fonts and theme,
+    /// register hotkeys, probe FFmpeg. Called once at startup by `eframe`.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
@@ -88,7 +94,8 @@ impl ClipperApp {
 
         let hotkey_manager = match HotkeyManager::new(
             &settings.hotkey_combo,
-            (!settings.record_hotkey_combo.is_empty()).then_some(settings.record_hotkey_combo.as_str()),
+            (!settings.record_hotkey_combo.is_empty())
+                .then_some(settings.record_hotkey_combo.as_str()),
         ) {
             Ok(hm) => Some(hm),
             Err(e) => {
@@ -147,7 +154,8 @@ impl ClipperApp {
         }
         match HotkeyManager::new(
             &self.settings.hotkey_combo,
-            (!self.settings.record_hotkey_combo.is_empty()).then_some(self.settings.record_hotkey_combo.as_str()),
+            (!self.settings.record_hotkey_combo.is_empty())
+                .then_some(self.settings.record_hotkey_combo.as_str()),
         ) {
             Ok(hm) => {
                 self.hotkey_manager = Some(hm);

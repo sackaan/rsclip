@@ -1,8 +1,8 @@
-// Live encoding pipeline.
-//
-// A persistent FFmpeg subprocess encodes raw BGRA frames to H.264 MPEG-TS in
-// real time. Saving a clip snapshots the encoded buffer and remuxes to MP4
-// (stream copy, no re-encode).
+//! Live encoding pipeline.
+//!
+//! A persistent FFmpeg subprocess encodes raw BGRA frames to H.264 MPEG-TS
+//! in real time. Saving a clip snapshots the encoded buffer and remuxes to
+//! MP4 (stream copy — no re-encode), with the mixed audio muxed in.
 
 use std::io::{Read, Write};
 use std::process::{Child, Stdio};
@@ -49,6 +49,10 @@ pub struct LiveEncoder {
 }
 
 impl LiveEncoder {
+    /// Spawn FFmpeg and the supporting threads. Returns once the child is
+    /// running and ready to receive frames on the [`frame_sender`].
+    ///
+    /// [`frame_sender`]: LiveEncoder::frame_sender
     pub fn start(cfg: EncoderConfig) -> anyhow::Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let encoded_buffer: SharedEncodedBuffer =
@@ -75,9 +79,18 @@ impl LiveEncoder {
             Err(e) => return Err(e),
         };
 
-        let stdin = child.stdin.take().expect("FFmpeg stdin");
-        let stdout = child.stdout.take().expect("FFmpeg stdout");
-        let stderr = child.stderr.take().expect("FFmpeg stderr");
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("FFmpeg child did not expose stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("FFmpeg child did not expose stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("FFmpeg child did not expose stderr"))?;
 
         std::thread::Builder::new()
             .name("encoder-stderr".into())
@@ -286,23 +299,29 @@ impl LiveEncoder {
             .map_err(|e| anyhow::anyhow!("Failed to start FFmpeg: {}", e))
     }
 
+    /// Clone the channel used to feed raw frames into the encoder.
     pub fn frame_sender(&self) -> Sender<RawFrame> {
         self.frame_tx.clone()
     }
 
+    /// Borrow the shared encoded ring buffer (read by the GUI for status,
+    /// snapshotted on save).
     pub fn encoded_buffer(&self) -> &SharedEncodedBuffer {
         &self.encoded_buffer
     }
 
+    /// Borrow the latest downscaled preview frame (refreshed ~4× per second).
     pub fn preview_frame(&self) -> &SharedPreviewFrame {
         &self.preview_frame
     }
 
+    /// Which hardware encoder ended up active (`Software` = libx264).
     pub fn hw_encoder(&self) -> HwEncoder {
         self.hw_encoder
     }
 
-    /// Queue a clip save request. Returns `true` if accepted.
+    /// Queue a clip save request. Returns `true` if accepted, `false` if
+    /// the encoded buffer is empty or the save worker queue is full.
     pub fn save_clip(
         &self,
         output_dir: &str,
@@ -324,10 +343,13 @@ impl LiveEncoder {
             .is_ok()
     }
 
+    /// Poll for a finished save result. Non-blocking. Drains one result per
+    /// call.
     pub fn poll_result(&self) -> Option<anyhow::Result<String>> {
         self.result_rx.try_recv().ok()
     }
 
+    /// Signal all worker threads to wind down. Idempotent.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }

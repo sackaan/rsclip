@@ -1,4 +1,4 @@
-// Time-limited circular buffer of encoded MPEG-TS data.
+//! Time-limited circular buffer of encoded MPEG-TS data.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -12,6 +12,10 @@ struct EncodedChunk {
 }
 
 /// Circular buffer of encoded MPEG-TS video data, evicted by elapsed time.
+///
+/// Chunks are timestamped on insertion. Eviction compares the front chunk's
+/// timestamp to the most recent one and discards anything past the retention
+/// window (plus a small margin so trims never cut content short).
 pub struct EncodedReplayBuffer {
     chunks: VecDeque<EncodedChunk>,
     max_duration: Duration,
@@ -19,6 +23,9 @@ pub struct EncodedReplayBuffer {
 }
 
 impl EncodedReplayBuffer {
+    /// Create an empty buffer that retains roughly `max_duration_secs` of
+    /// data (plus a small over-fill margin so trims never cut content
+    /// short).
     pub fn new(max_duration_secs: u32) -> Self {
         Self {
             chunks: VecDeque::new(),
@@ -27,6 +34,8 @@ impl EncodedReplayBuffer {
         }
     }
 
+    /// Append a chunk produced by the encoder. Old chunks past the retention
+    /// window are evicted automatically.
     pub fn push(&mut self, data: Vec<u8>) {
         self.total_bytes += data.len();
         self.chunks.push_back(EncodedChunk {
@@ -56,6 +65,7 @@ impl EncodedReplayBuffer {
         }
     }
 
+    /// Concatenate all retained chunks into a single byte vector for muxing.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.total_bytes);
         for chunk in &self.chunks {
@@ -64,6 +74,7 @@ impl EncodedReplayBuffer {
         buf
     }
 
+    /// Wall-clock span between the oldest and newest retained chunks.
     pub fn duration_secs(&self) -> f64 {
         if self.chunks.len() < 2 {
             return 0.0;
@@ -73,10 +84,12 @@ impl EncodedReplayBuffer {
         last.duration_since(first).as_secs_f64()
     }
 
+    /// Total bytes currently retained.
     pub fn memory_usage_bytes(&self) -> usize {
         self.total_bytes
     }
 
+    /// Whether the buffer holds no chunks at all.
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
@@ -92,12 +105,15 @@ impl EncodedReplayBuffer {
         self.chunks.len()
     }
 
+    /// Update the retention window and immediately evict any chunks that
+    /// now fall outside it.
     pub fn set_max_duration(&mut self, secs: u32) {
         self.max_duration = Duration::from_secs(secs as u64);
         self.evict_old();
     }
 }
 
+/// Shared, lock-protected handle to the [`EncodedReplayBuffer`].
 pub type SharedEncodedBuffer = Arc<RwLock<EncodedReplayBuffer>>;
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
-// Audio capture and mixing.
-//
-// Each audio source (game, microphone) gets its own `AudioChannel` with a
-// ring buffer. At save time the `AudioMixer` blends all channels into a
-// single WAV.
+//! Audio capture and mixing.
+//!
+//! Each audio source (game, microphone) gets its own [`AudioChannel`]
+//! backed by a ring buffer. At save time the [`AudioMixer`] blends all
+//! channels into a single WAV that the encoder remuxes into the final MP4.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,9 +23,15 @@ pub(super) struct AudioRingBuffer {
     write_pos: usize,
     filled: usize,
     sample_rate: u32,
+    // Source-format fields. The active save path (`AudioMixer::snapshot_mixed_wav`)
+    // assumes the canonical 48 kHz / stereo / f32 layout, so these are only
+    // read by `snapshot_wav` (covered by tests).
+    #[allow(dead_code)]
     channels: u16,
+    #[allow(dead_code)]
     bits_per_sample: u16,
     block_align: u16,
+    #[allow(dead_code)]
     is_float: bool,
     /// Monotonic count of all bytes ever pushed (including silence).
     /// Used with `capture_start` to compute the effective byte rate,
@@ -171,6 +177,7 @@ impl AudioRingBuffer {
             .collect()
     }
 
+    #[allow(dead_code)] // used by unit tests; kept as the natural counterpart to snapshot_pcm_f32
     fn snapshot_wav(&self, seconds: f64) -> Vec<u8> {
         if self.block_align == 0 || self.sample_rate == 0 {
             return Vec::new();
@@ -264,8 +271,12 @@ pub enum ChannelKind {
     Microphone,
 }
 
+/// A single audio source with its own background capture thread and ring
+/// buffer.
 pub struct AudioChannel {
+    /// Source kind (game loopback or microphone).
     pub kind: ChannelKind,
+    /// Linear scaling factor applied when mixing (1.0 = unity, 0.0 = mute).
     pub volume: f32,
     running: Arc<AtomicBool>,
     buffer: SharedAudioBuffer,
@@ -304,7 +315,7 @@ impl AudioChannel {
     }
 
     fn switch_pid(&mut self, new_pid: u32) -> Result<()> {
-        assert_eq!(self.kind, ChannelKind::Game);
+        debug_assert_eq!(self.kind, ChannelKind::Game);
 
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.thread.take() {
@@ -380,13 +391,15 @@ fn spawn_mic_thread(
     Ok(handle)
 }
 
-/// Manages multiple audio sources and mixes them at save time.
+/// Manages multiple audio sources and mixes them on demand.
 pub struct AudioMixer {
     channels: Vec<AudioChannel>,
     buffer_seconds: u32,
 }
 
 impl AudioMixer {
+    /// Create an empty mixer sized for `buffer_seconds` of buffered audio
+    /// per channel.
     pub fn new(buffer_seconds: u32) -> Self {
         Self {
             channels: Vec::new(),
@@ -394,6 +407,7 @@ impl AudioMixer {
         }
     }
 
+    /// Start capturing game audio for `pid` via WASAPI process loopback.
     pub fn add_game_channel(&mut self, pid: u32) -> Result<()> {
         let mut ch = AudioChannel::start_game(self.buffer_seconds, pid)?;
         ch.volume = 1.0;
@@ -401,6 +415,7 @@ impl AudioMixer {
         Ok(())
     }
 
+    /// Start capturing microphone audio from the given WASAPI endpoint id.
     pub fn add_mic_channel(&mut self, device_id: &str) -> Result<()> {
         let mut ch = AudioChannel::start_mic(self.buffer_seconds, device_id)?;
         ch.volume = 1.0;
@@ -408,11 +423,14 @@ impl AudioMixer {
         Ok(())
     }
 
+    /// Stop and remove the microphone channel, if any.
     pub fn remove_mic_channel(&mut self) {
         self.channels
             .retain(|ch| ch.kind != ChannelKind::Microphone);
     }
 
+    /// Repoint the game-audio channel at a new process. Creates the channel
+    /// if it doesn't exist yet.
     pub fn switch_game_pid(&mut self, new_pid: u32) -> Result<()> {
         if let Some(ch) = self
             .channels
@@ -425,26 +443,24 @@ impl AudioMixer {
         }
     }
 
+    /// Borrow the game channel mutably for volume tweaks.
     pub fn game_channel_mut(&mut self) -> Option<&mut AudioChannel> {
         self.channels
             .iter_mut()
             .find(|c| c.kind == ChannelKind::Game)
     }
 
+    /// Borrow the microphone channel mutably for volume tweaks.
     pub fn mic_channel_mut(&mut self) -> Option<&mut AudioChannel> {
         self.channels
             .iter_mut()
             .find(|c| c.kind == ChannelKind::Microphone)
     }
 
-    pub fn has_mic(&self) -> bool {
-        self.channels
-            .iter()
-            .any(|c| c.kind == ChannelKind::Microphone)
-    }
-
-    /// Mix all active channels into a single WAV. Shorter channels are
-    /// right-aligned so audio aligns to "now" at the end.
+    /// Mix all active channels into a single WAV.
+    ///
+    /// Shorter channels are right-aligned so audio aligns to "now" at the
+    /// end of the clip. Returns an empty vector if no channel has audio.
     pub fn snapshot_mixed_wav(&self, seconds: f64) -> Vec<u8> {
         let active: Vec<_> = self.channels.iter().filter(|c| c.volume > 0.0).collect();
 
@@ -497,6 +513,7 @@ impl AudioMixer {
         build_wav(&bytes, 48000, 2, 32, true)
     }
 
+    /// Stop every channel's capture thread. Idempotent.
     pub fn stop(&self) {
         for ch in &self.channels {
             ch.stop();
@@ -510,6 +527,7 @@ impl Drop for AudioMixer {
     }
 }
 
+/// Enumerate active WASAPI capture endpoints (microphones / line-ins).
 pub fn enumerate_mic_devices() -> Result<Vec<MicDevice>> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);

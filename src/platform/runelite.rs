@@ -1,8 +1,9 @@
-// RuneLite window and game canvas detection via Win32 APIs.
-//
-// RuneLite is a Java/Swing app. The game renders in a `java.awt.Canvas`
-// child window (class "SunAwtCanvas"). We capture the full top-level window
-// and compute a crop rectangle for the canvas.
+//! RuneLite window and game canvas detection via Win32 APIs.
+//!
+//! RuneLite is a Java/Swing app. The game renders in a `java.awt.Canvas`
+//! child window (class `SunAwtCanvas`). We capture the full top-level window
+//! and compute a crop rectangle for the canvas so the saved clip contains
+//! only the game viewport — no chat, side panels, or window chrome.
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
@@ -16,35 +17,56 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, IsWindow,
 };
 
+/// Sub-rectangle of a captured frame to retain (game canvas inside the
+/// RuneLite window).
 #[derive(Debug, Clone, Copy)]
 pub struct CropRect {
+    /// Left edge offset within the source frame, in pixels.
     pub x: u32,
+    /// Top edge offset within the source frame, in pixels.
     pub y: u32,
+    /// Crop width in pixels.
     pub width: u32,
+    /// Crop height in pixels.
     pub height: u32,
 }
 
+/// A detected RuneLite client window.
 #[derive(Debug, Clone)]
 pub struct RuneLiteWindow {
+    /// Top-level window handle.
     pub hwnd: isize,
+    /// Handle of the `SunAwtCanvas` child window, if found.
     pub canvas_hwnd: Option<isize>,
+    /// Effective width: canvas size when the canvas was detected, otherwise
+    /// the full window client size.
     pub width: u32,
+    /// Effective height (see [`width`](Self::width)).
     pub height: u32,
+    /// Whether canvas detection succeeded (used to label clips and pick a
+    /// crop rectangle).
     pub canvas_found: bool,
+    /// Process id of the RuneLite instance — used by per-process audio capture.
     pub pid: u32,
 }
 
 impl RuneLiteWindow {
+    /// HWND to feed to Windows Graphics Capture (always the top-level
+    /// window — WGC cannot capture child windows directly).
     pub fn capture_hwnd(&self) -> isize {
         self.hwnd
     }
 
+    /// Compute the canvas crop rectangle relative to the captured top-level
+    /// frame, if a canvas was found.
     pub fn canvas_crop_rect(&self) -> Option<CropRect> {
         let canvas_hwnd = self.canvas_hwnd?;
         compute_crop_rect(self.hwnd, canvas_hwnd).ok()
     }
 }
 
+/// Enumerate every visible RuneLite top-level window, excluding our own
+/// process.
 pub fn find_all_runelite_windows() -> Vec<RuneLiteWindow> {
     let mut candidates: Vec<(HWND, String)> = Vec::new();
 
@@ -69,17 +91,21 @@ pub fn find_all_runelite_windows() -> Vec<RuneLiteWindow> {
     windows
 }
 
+/// Return the handle of the currently focused RuneLite window, if any of
+/// `windows` is foregrounded.
 pub fn focused_runelite_hwnd(windows: &[RuneLiteWindow]) -> Option<isize> {
     let fg = unsafe { GetForegroundWindow() };
     let fg_isize = fg.0 as isize;
     windows.iter().find(|w| w.hwnd == fg_isize).map(|w| w.hwnd)
 }
 
+/// Whether the given HWND still refers to a live window.
 pub fn is_window_alive(hwnd: isize) -> bool {
     let h = HWND(hwnd as *mut _);
     unsafe { IsWindow(h).as_bool() }
 }
 
+/// Client-area size of a window, in pixels.
 pub fn get_window_size(hwnd: isize) -> Result<(u32, u32)> {
     let h = HWND(hwnd as *mut _);
     let mut rect = RECT::default();

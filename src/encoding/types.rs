@@ -1,19 +1,31 @@
+//! Frame and request types shared between capture, encoding, and the GUI.
+
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+/// A raw BGRA frame produced by [`crate::capture::screen`].
 pub struct RawFrame {
+    /// Pixel data, `width * height * 4` bytes, BGRA, top-down, packed.
     pub data: Vec<u8>,
+    /// Frame width in pixels.
     pub width: u32,
+    /// Frame height in pixels.
     pub height: u32,
 }
 
+/// A small RGBA thumbnail used to render the live preview in the GUI.
 pub struct PreviewFrame {
+    /// Pixel data, `width * height * 4` bytes, RGBA, top-down.
     pub rgba: Vec<u8>,
+    /// Thumbnail width in pixels (≤ 320).
     pub width: u32,
+    /// Thumbnail height in pixels.
     pub height: u32,
 }
 
+/// Shared slot used by the encoder/preview thread to publish the latest
+/// preview frame; read once per GUI repaint.
 pub type SharedPreviewFrame = Arc<Mutex<Option<PreviewFrame>>>;
 
 pub(crate) struct SaveRequest {
@@ -27,7 +39,8 @@ pub(crate) struct SaveRequest {
 const PREVIEW_MAX_WIDTH: usize = 320;
 
 /// Build a small RGBA preview from a full BGRA raw frame using
-/// nearest-neighbor downscaling.
+/// nearest-neighbour downscaling. Output is capped at [`PREVIEW_MAX_WIDTH`]
+/// pixels wide while preserving the input aspect ratio.
 pub fn build_preview_frame(raw: &RawFrame) -> PreviewFrame {
     let src_w = raw.width as usize;
     let src_h = raw.height as usize;

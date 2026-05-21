@@ -1,8 +1,13 @@
+//! Global hotkey registration plus a small egui-key → combo-string mapper
+//! used by the in-app "press to bind" widget.
+
 use anyhow::{Context, Result};
 use eframe::egui;
 use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager};
 use log::info;
 
+/// Owns the [`GlobalHotKeyManager`] and the registered save/record hotkeys.
+/// Hotkeys are unregistered automatically when this is dropped.
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
     save_hotkey: HotKey,
@@ -12,6 +17,9 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
+    /// Register the save hotkey (required) and the start/stop hotkey
+    /// (optional). Combo strings use the syntax accepted by
+    /// [`HotKey::from_str`] (e.g. `"F8"`, `"Control+Shift+F8"`).
     pub fn new(save_key: &str, record_key: Option<&str>) -> Result<Self> {
         let manager = GlobalHotKeyManager::new().context("Failed to create GlobalHotKeyManager")?;
 
@@ -54,14 +62,19 @@ impl HotkeyManager {
         })
     }
 
+    /// Id assigned to the save-clip hotkey, for matching against
+    /// [`GlobalHotKeyEvent::id`].
     pub fn save_hotkey_id(&self) -> u32 {
         self.save_hotkey_id
     }
 
+    /// Id assigned to the start/stop hotkey, if one was registered.
     pub fn record_hotkey_id(&self) -> Option<u32> {
         self.record_hotkey_id
     }
 
+    /// Unregister every hotkey currently held. Idempotent; called from
+    /// [`Drop`].
     pub fn unregister_all(&self) {
         let _ = self.manager.unregister(self.save_hotkey);
         if let Some(hk) = self.record_hotkey {
@@ -77,10 +90,14 @@ impl Drop for HotkeyManager {
     }
 }
 
+/// Non-blocking poll for the next global hotkey event. Returns `None` if
+/// the queue is empty.
 pub fn poll_hotkey_event() -> Option<GlobalHotKeyEvent> {
     GlobalHotKeyEvent::receiver().try_recv().ok()
 }
 
+/// Map an `egui` key to the equivalent `KeyboardEvent.code` string used by
+/// `global-hotkey` (`"KeyA"`, `"F8"`, `"Digit3"`, …).
 pub fn egui_key_to_code_str(key: &egui::Key) -> Option<&'static str> {
     use egui::Key;
     Some(match key {
@@ -165,6 +182,8 @@ pub fn egui_key_to_code_str(key: &egui::Key) -> Option<&'static str> {
     })
 }
 
+/// Build the combo string accepted by `global-hotkey`
+/// (e.g. `"Control+Shift+F8"`) from the modifiers and key in an egui event.
 pub fn build_hotkey_string(modifiers: &egui::Modifiers, key: &egui::Key) -> Option<String> {
     let code_str = egui_key_to_code_str(key)?;
 
@@ -183,6 +202,8 @@ pub fn build_hotkey_string(modifiers: &egui::Modifiers, key: &egui::Key) -> Opti
     Some(parts.join("+"))
 }
 
+/// Human-friendly rendering of a hotkey combo (e.g. `"Ctrl + Shift + F8"`)
+/// for the GUI label.
 pub fn display_hotkey_string(modifiers: &egui::Modifiers, key: &egui::Key) -> Option<String> {
     let key_name = egui_key_to_code_str(key)?;
     let display_key = if let Some(stripped) = key_name.strip_prefix("Key") {

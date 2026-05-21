@@ -1,4 +1,10 @@
-// Low-level WASAPI internals for per-process audio capture (Windows 10 2004+).
+//! Low-level WASAPI internals.
+//!
+//! - Per-process audio capture (Windows 10 build 20348+) for game audio.
+//! - Standard device capture for microphones.
+//! - A stateful linear resampler that carries fractional sample position
+//!   across chunk boundaries (otherwise long sessions drift audibly — the
+//!   same class of bug OBS avoids).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -232,7 +238,9 @@ pub(super) unsafe fn process_loopback_loop(
 /// A discovered microphone / audio input device.
 #[derive(Clone, Debug)]
 pub struct MicDevice {
+    /// WASAPI endpoint id (stable across reboots; suitable for persistence).
     pub id: String,
+    /// Human-friendly device name as shown in the OS sound settings.
     pub name: String,
 }
 
@@ -538,4 +546,3 @@ fn to_stereo(samples: &[f32], src_channels: u16, num_frames: usize) -> Vec<f32> 
     }
     out
 }
-

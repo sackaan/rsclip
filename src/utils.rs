@@ -1,7 +1,19 @@
+//! Defaults, filesystem helpers, and the small status/severity types shared
+//! between the GUI and the backend.
+
 use anyhow::Result;
 use chrono::Local;
 use std::path::{Path, PathBuf};
 
+/// Default rolling-buffer length, in seconds.
+pub const DEFAULT_BUFFER_SECONDS: u32 = 30;
+/// Default capture/encode frame rate.
+pub const DEFAULT_FPS: u32 = 60;
+/// Default save-clip hotkey combo string (parsed by `global-hotkey`).
+pub const DEFAULT_HOTKEY_NAME: &str = "F8";
+
+/// Default clips output directory: `<user videos>/RSClips`, or `./clips` if
+/// the user-videos folder cannot be resolved.
 pub fn default_clips_dir() -> String {
     dirs::video_dir()
         .map(|p| p.join("RSClips"))
@@ -10,15 +22,14 @@ pub fn default_clips_dir() -> String {
         .into_owned()
 }
 
-pub const DEFAULT_BUFFER_SECONDS: u32 = 30;
-pub const DEFAULT_FPS: u32 = 60;
-pub const DEFAULT_HOTKEY_NAME: &str = "F8";
-
+/// Build a timestamped clip filename (`RSClip_YYYYMMDD_HHMMSS.mp4`) using
+/// the local clock.
 pub fn clip_filename() -> String {
     let now = Local::now();
     now.format("RSClip_%Y%m%d_%H%M%S.mp4").to_string()
 }
 
+/// Ensure `base` exists as a directory, creating it (and parents) if not.
 pub fn ensure_clips_dir(base: &str) -> Result<PathBuf> {
     let path = Path::new(base);
     if !path.exists() {
@@ -27,6 +38,7 @@ pub fn ensure_clips_dir(base: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Open `dir` in the system file explorer, creating it first if needed.
 pub fn open_clips_folder(dir: &str) -> Result<()> {
     let path = Path::new(dir);
     if !path.exists() {
@@ -36,29 +48,43 @@ pub fn open_clips_folder(dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// High-level recorder state surfaced to the GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingStatus {
+    /// No capture running.
     Idle,
+    /// Frames are being buffered.
     Recording,
+    /// A save is in flight (remux to MP4).
     Saving,
+    /// The last operation failed; see [`StatusMessage`] for details.
     Error,
 }
 
+/// Severity used to colour [`StatusMessage`] in the GUI footer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
+    /// Informational (default colour).
     Info,
+    /// Successful operation (green).
     Success,
+    /// Non-fatal problem (orange).
     Warning,
+    /// Fatal/blocking problem (red).
     Error,
 }
 
+/// A single status line shown to the user.
 #[derive(Debug, Clone)]
 pub struct StatusMessage {
+    /// Free-form message text.
     pub text: String,
+    /// Severity controlling the rendered colour.
     pub severity: Severity,
 }
 
 impl StatusMessage {
+    /// Build an informational message.
     pub fn info(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -66,6 +92,7 @@ impl StatusMessage {
         }
     }
 
+    /// Build a success message.
     pub fn success(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -73,6 +100,7 @@ impl StatusMessage {
         }
     }
 
+    /// Build a warning message.
     pub fn warning(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -80,6 +108,7 @@ impl StatusMessage {
         }
     }
 
+    /// Build an error message.
     pub fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),

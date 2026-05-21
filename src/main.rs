@@ -1,4 +1,20 @@
+//! RSClip — instant-replay clipper for RuneLite (Old School RuneScape).
+//!
+//! Continuously buffers the last N seconds of the RuneLite game canvas via
+//! Windows Graphics Capture, encodes them live through an FFmpeg subprocess,
+//! and dumps the buffered window to MP4 on hotkey.
+//!
+//! The crate is organised into four top-level modules:
+//!
+//! - [`capture`] — Windows Graphics Capture + WASAPI audio capture.
+//! - [`encoding`] — FFmpeg pipeline, encoded ring buffer, and MP4 remux.
+//! - [`platform`] — Win32 glue: RuneLite window discovery, global hotkeys.
+//! - [`ui`] — the egui-based GUI.
+//!
+//! See the project README for build instructions and an architecture overview.
+
 #![windows_subsystem = "windows"]
+#![warn(missing_docs, rust_2018_idioms)]
 
 mod capture;
 mod encoding;
@@ -9,6 +25,8 @@ mod utils;
 
 use eframe::egui;
 
+/// Decode the embedded PNG icon into an `egui` icon data buffer for the
+/// title bar.
 fn load_icon() -> Option<egui::IconData> {
     let png_bytes = include_bytes!("assets/icon2.png");
     let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();

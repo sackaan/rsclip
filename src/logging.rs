@@ -7,13 +7,21 @@ use parking_lot::Mutex;
 
 const MAX_LOG_LINES: usize = 500;
 
+/// A single line stored in the in-memory log ring buffer.
 #[derive(Clone)]
 pub struct LogEntry {
+    /// Original `log` crate level.
     pub level: log::Level,
+    /// Formatted message body.
     pub message: String,
+    /// `HH:MM:SS` local time when the log was recorded.
     pub timestamp: String,
 }
 
+/// Thread-safe ring buffer of recent log entries surfaced in the GUI console.
+///
+/// Bounded to [`MAX_LOG_LINES`]. A generation counter lets the GUI cheaply
+/// detect when new entries have arrived without re-cloning every frame.
 pub struct GuiLogger {
     lines: Mutex<VecDeque<LogEntry>>,
     level: log::LevelFilter,
@@ -21,6 +29,7 @@ pub struct GuiLogger {
 }
 
 impl GuiLogger {
+    /// Construct an empty logger filtered to `level`.
     pub fn new(level: log::LevelFilter) -> Self {
         Self {
             lines: Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)),
@@ -29,7 +38,8 @@ impl GuiLogger {
         }
     }
 
-    /// Returns log entries only if new ones have been added since `last_gen`.
+    /// Return a snapshot of all entries iff new ones have been pushed since
+    /// `last_gen`. Updates `last_gen` to the current generation on return.
     pub fn entries_if_changed(&self, last_gen: &mut u64) -> Option<Vec<LogEntry>> {
         let current = self.generation.load(Ordering::Relaxed);
         if current == *last_gen {
@@ -41,11 +51,11 @@ impl GuiLogger {
 }
 
 impl log::Log for GuiLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         metadata.level() <= self.level
     }
 
-    fn log(&self, record: &log::Record) {
+    fn log(&self, record: &log::Record<'_>) {
         if !self.enabled(record.metadata()) {
             return;
         }
@@ -76,6 +86,11 @@ impl log::Log for GuiLogger {
 
 static GUI_LOGGER: std::sync::OnceLock<&'static GuiLogger> = std::sync::OnceLock::new();
 
+/// Install the GUI logger as the global `log` sink.
+///
+/// Safe to call multiple times; subsequent calls are no-ops. The logger is
+/// leaked into `'static` storage on first call so it can be referenced by
+/// the `log` facade for the lifetime of the process.
 pub fn init_gui_logger(level: log::LevelFilter) {
     let logger = Box::leak(Box::new(GuiLogger::new(level)));
     GUI_LOGGER.set(logger).ok();
@@ -83,6 +98,7 @@ pub fn init_gui_logger(level: log::LevelFilter) {
     log::set_max_level(level);
 }
 
+/// Borrow the installed logger, if [`init_gui_logger`] has run.
 pub fn gui_logger() -> Option<&'static GuiLogger> {
     GUI_LOGGER.get().copied()
 }
