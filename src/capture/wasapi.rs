@@ -24,6 +24,12 @@ use super::audio::SharedAudioBuffer;
 
 pub(super) const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 
+/// WASAPI capture buffer length, in 100-ns units (200 ms). Capture is
+/// drained every ~10 ms; a generous buffer costs no latency that matters
+/// for a replay buffer and stops samples being lost when this thread is
+/// briefly starved by the game.
+const CAPTURE_BUFFER_HNS: i64 = 2_000_000;
+
 /// Completion handler for ActivateAudioInterfaceAsync.
 #[windows::core::implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
@@ -177,7 +183,7 @@ pub(super) unsafe fn process_loopback_loop(
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            200_000, // 20 ms in 100-ns units
+            CAPTURE_BUFFER_HNS,
             0,
             &format as *const _,
             None,
@@ -404,7 +410,7 @@ pub(super) unsafe fn device_capture_loop(
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_NOPERSIST,
-            200_000, // 20 ms in 100-ns units
+            CAPTURE_BUFFER_HNS,
             0,
             format_ptr,
             None,

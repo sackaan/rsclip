@@ -40,6 +40,10 @@ pub(super) struct AudioRingBuffer {
     total_bytes_written: u64,
     /// Wall-clock instant when the first audio data arrived.
     capture_start: Option<Instant>,
+    /// Wall-clock instant of the most recent push. Measuring the rate up to
+    /// here (not up to "now") keeps it correct after capture stops, so a
+    /// stopped buffer can still be saved.
+    last_push: Option<Instant>,
 }
 
 impl AudioRingBuffer {
@@ -66,6 +70,7 @@ impl AudioRingBuffer {
             is_float,
             total_bytes_written: 0,
             capture_start: None,
+            last_push: None,
         }
     }
 
@@ -78,8 +83,8 @@ impl AudioRingBuffer {
     /// use when extracting a time-based snapshot from the ring buffer.
     fn effective_bytes_per_sec(&self) -> f64 {
         let nominal = self.sample_rate as f64 * self.block_align as f64;
-        if let Some(start) = self.capture_start {
-            let elapsed = start.elapsed().as_secs_f64();
+        if let (Some(start), Some(last)) = (self.capture_start, self.last_push) {
+            let elapsed = last.duration_since(start).as_secs_f64();
             // Only trust the measurement after enough data has accumulated.
             if elapsed >= 1.0 && self.total_bytes_written > nominal as u64 {
                 return self.total_bytes_written as f64 / elapsed;
@@ -94,9 +99,9 @@ impl AudioRingBuffer {
             return;
         }
 
-        if self.capture_start.is_none() {
-            self.capture_start = Some(Instant::now());
-        }
+        let now = Instant::now();
+        self.capture_start.get_or_insert(now);
+        self.last_push = Some(now);
         self.total_bytes_written += pcm.len() as u64;
 
         let len = pcm.len();
@@ -125,9 +130,9 @@ impl AudioRingBuffer {
             return;
         }
 
-        if self.capture_start.is_none() {
-            self.capture_start = Some(Instant::now());
-        }
+        let now = Instant::now();
+        self.capture_start.get_or_insert(now);
+        self.last_push = Some(now);
         self.total_bytes_written += count as u64;
 
         let len = count.min(cap);
@@ -691,6 +696,20 @@ mod tests {
         assert_eq!(pcm.len(), 2); // 1 frame = 2 samples
         assert!((pcm[0] - 0.5).abs() < f32::EPSILON);
         assert!((pcm[1] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_effective_rate_frozen_after_capture_stops() {
+        let mut buf = AudioRingBuffer::new(5, 48000, 2, 32, true);
+        // Two seconds of audio delivered over exactly two seconds.
+        buf.push(&vec![0u8; 2 * 384_000]);
+        let start = Instant::now() - std::time::Duration::from_secs(10);
+        buf.capture_start = Some(start);
+        buf.last_push = Some(start + std::time::Duration::from_secs(2));
+        // Capture stopped 8 s ago; the rate must not decay with wall time.
+        let rate = buf.effective_bytes_per_sec();
+        assert!((rate - 384_000.0).abs() < 1.0, "rate {rate}");
+        assert_eq!(buf.snapshot_pcm_f32(1.0).len(), 96_000);
     }
 
     #[test]
