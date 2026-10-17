@@ -48,6 +48,9 @@ const BGRA_POOL_SIZE: usize = 4;
 /// Bounded queue depth between capture and encoder. Small so we drop rather
 /// than let the encoder lag the game.
 const FRAME_QUEUE_DEPTH: usize = 2;
+// Queued textures + the one the encoder is converting must never include
+// the next slot `forward_frame` copies into.
+const _: () = assert!(BGRA_POOL_SIZE > FRAME_QUEUE_DEPTH + 1);
 
 /// Handle to a running CS2 capture+encode session. Drop or call `stop()`.
 pub struct Cs2CaptureHandle {
@@ -164,7 +167,9 @@ pub fn start_cs2_capture(
     let pool_cb = bgra_pool.clone();
     let tx_cb = frame_tx.clone();
     let dropped_cb = dropped_frames.clone();
-    let frame_index = Arc::new(AtomicU64::new(0));
+    // Next pool slot. Held across copy + send so overlapping callbacks
+    // can't pick the same texture.
+    let next_slot = Arc::new(Mutex::new(0usize));
 
     frame_pool.FrameArrived(&TypedEventHandler::new(
         move |pool: &Option<Direct3D11CaptureFramePool>, _| {
@@ -182,7 +187,7 @@ pub fn start_cs2_capture(
                 &frame,
                 &context_cb,
                 &pool_cb,
-                &frame_index,
+                &next_slot,
                 &tx_cb,
                 &dropped_cb,
             ) {
@@ -209,7 +214,7 @@ fn forward_frame(
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
     context: &ID3D11DeviceContext,
     bgra_pool: &[ID3D11Texture2D],
-    frame_index: &AtomicU64,
+    next_slot: &Mutex<usize>,
     tx: &Sender<CapturedFrame>,
     dropped: &AtomicU64,
 ) -> Result<()> {
@@ -226,14 +231,23 @@ fn forward_frame(
     // speed downstream. Only the differences between frames matter.
     let pts = frame.SystemRelativeTime().map(|t| t.Duration).unwrap_or(0);
 
-    let idx = frame_index.fetch_add(1, Ordering::Relaxed);
-    let dst = bgra_pool[idx as usize % bgra_pool.len()].clone();
+    // Up to FRAME_QUEUE_DEPTH textures sit in the queue and one is being
+    // converted by the encoder. The slot only advances when a frame is
+    // actually handed over, so the next slot is never one of those; and a
+    // full queue drops the frame *before* copying over a pool texture.
+    let mut slot = next_slot.lock();
+    if tx.is_full() {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        metrics::mark_dropped();
+        return Ok(());
+    }
+    let dst = bgra_pool[*slot % bgra_pool.len()].clone();
 
     // GPU→GPU copy; the source surface is only valid during this callback.
     unsafe { context.CopyResource(&dst, &src) };
 
     match tx.try_send((dst, pts, captured)) {
-        Ok(()) => {}
+        Ok(()) => *slot += 1,
         Err(TrySendError::Full(_)) => {
             dropped.fetch_add(1, Ordering::Relaxed);
             metrics::mark_dropped();
