@@ -250,11 +250,7 @@ mod imp {
         }
     }
 
-    fn write_summary(
-        path: &PathBuf,
-        elapsed: Duration,
-        sampler: &Sampler,
-    ) -> std::io::Result<()> {
+    fn write_summary(path: &PathBuf, elapsed: Duration, sampler: &Sampler) -> std::io::Result<()> {
         let mut out = BufWriter::new(File::create(path)?);
         let (frames, dropped) = crate::metrics::frame_counts();
         let alloc = alloc::snapshot();
@@ -271,7 +267,11 @@ mod imp {
                 dropped as f64 / (frames + dropped) as f64 * 100.0
             )?;
         }
-        writeln!(out, "mean fps        : {:.2}", frames as f64 / elapsed.as_secs_f64())?;
+        writeln!(
+            out,
+            "mean fps        : {:.2}",
+            frames as f64 / elapsed.as_secs_f64()
+        )?;
         writeln!(out)?;
         writeln!(out, "allocations (whole process, whole run)")?;
         writeln!(out, "  total allocs      : {}", alloc.allocs)?;

@@ -378,9 +378,7 @@ mod imp {
         }
 
         pub(super) fn percentiles(&self, stage: Stage) -> Vec<(f64, u64)> {
-            const QUANTILES: [f64; 9] = [
-                0.0, 0.25, 0.50, 0.75, 0.90, 0.99, 0.999, 0.9999, 1.0,
-            ];
+            const QUANTILES: [f64; 9] = [0.0, 0.25, 0.50, 0.75, 0.90, 0.99, 0.999, 0.9999, 1.0];
             let h = self.stages[stage as usize].lock();
             QUANTILES
                 .iter()

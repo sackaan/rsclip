@@ -30,7 +30,8 @@ use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_L
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -124,8 +125,7 @@ pub fn start_cs2_capture(
     let bgra_pool = create_bgra_pool(&device, width, height)?;
     let bgra_pool = Arc::new(bgra_pool);
 
-    let (frame_tx, frame_rx) =
-        crossbeam_channel::bounded::<CapturedFrame>(FRAME_QUEUE_DEPTH);
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<CapturedFrame>(FRAME_QUEUE_DEPTH);
 
     // --- Encoder thread ---
     let encoder_thread = {
@@ -140,15 +140,14 @@ pub fn start_cs2_capture(
                 // Media Foundation requires an MTA apartment on this thread.
                 let _com = ComGuard::new();
 
-                let mut encoder = match GpuH264Encoder::new(
-                    device, context, width, height, fps, bitrate_kbps,
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!("CS2 GPU encoder init failed: {e:#}");
-                        return;
-                    }
-                };
+                let mut encoder =
+                    match GpuH264Encoder::new(device, context, width, height, fps, bitrate_kbps) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!("CS2 GPU encoder init failed: {e:#}");
+                            return;
+                        }
+                    };
 
                 // Drive the encoder's event loop until capture stops.
                 encoder.run(frame_rx, buffer, running);

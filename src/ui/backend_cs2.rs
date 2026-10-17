@@ -71,7 +71,9 @@ impl ClipperApp {
 
         let fps = self.settings.cs2_capture_fps;
         let bitrate = self.settings.cs2_bitrate_kbps;
-        let buffer = Arc::new(Mutex::new(EncodedAuBuffer::new(self.settings.buffer_seconds)));
+        let buffer = Arc::new(Mutex::new(EncodedAuBuffer::new(
+            self.settings.buffer_seconds,
+        )));
 
         match start_cs2_capture(
             win.capture_hwnd(),

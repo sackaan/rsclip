@@ -25,8 +25,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
@@ -62,9 +61,8 @@ pub fn enumerate_audio_sessions(excluded_pids: &[u32]) -> Result<Vec<AudioSessio
 unsafe fn enumerate_inner(excluded_pids: &[u32]) -> Result<Vec<AudioSession>> {
     let process_map = snapshot_processes().unwrap_or_default();
 
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .context("CoCreateInstance(MMDeviceEnumerator) failed")?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .context("CoCreateInstance(MMDeviceEnumerator) failed")?;
 
     let device = enumerator
         .GetDefaultAudioEndpoint(eRender, eMultimedia)
@@ -134,19 +132,22 @@ unsafe fn enumerate_inner(excluded_pids: &[u32]) -> Result<Vec<AudioSession>> {
     }
 
     let mut out: Vec<AudioSession> = by_exe.into_values().collect();
-    out.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    out.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
 
-    debug!("Enumerated {} unique audio-producing applications", out.len());
+    debug!(
+        "Enumerated {} unique audio-producing applications",
+        out.len()
+    );
     Ok(out)
 }
 
 /// Walk up the parent chain from `pid` while parents still share `exe_name`.
 /// Returns the topmost matching ancestor (or `pid` itself if no parent matches).
-fn eldest_ancestor_with_exe(
-    map: &HashMap<u32, ProcInfo>,
-    pid: u32,
-    exe_name: &str,
-) -> u32 {
+fn eldest_ancestor_with_exe(map: &HashMap<u32, ProcInfo>, pid: u32, exe_name: &str) -> u32 {
     let mut current = pid;
     // Guard against pathological loops in malformed snapshots.
     for _ in 0..64 {

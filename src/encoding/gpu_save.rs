@@ -229,6 +229,9 @@ mod tests {
 
     #[test]
     fn vf_with_blur_retimes_then_tmix() {
-        assert_eq!(build_vf(240, 60, 100), "setpts=N/240/TB,tmix=frames=4,fps=60");
+        assert_eq!(
+            build_vf(240, 60, 100),
+            "setpts=N/240/TB,tmix=frames=4,fps=60"
+        );
     }
 }

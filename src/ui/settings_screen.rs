@@ -3,10 +3,10 @@ use eframe::egui;
 use log::warn;
 
 use super::app::ClipperApp;
+use super::settings::{AppChannelConfig, GameTarget};
 use super::theme;
 use crate::capture::audio;
 use crate::capture::sessions;
-use super::settings::{AppChannelConfig, GameTarget};
 use crate::encoding::config::{RateControl, ScaleFilter, X264Preset};
 use crate::platform::hotkeys;
 
@@ -591,10 +591,7 @@ impl ClipperApp {
             {
                 self.settings.cs2_capture_fps = fps;
             }
-            ui.colored_label(
-                theme::dim(),
-                egui::RichText::new("≤ monitor Hz").size(9.0),
-            );
+            ui.colored_label(theme::dim(), egui::RichText::new("≤ monitor Hz").size(9.0));
         });
         ui.end_row();
 

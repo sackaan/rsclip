@@ -156,7 +156,9 @@ impl GpuH264Encoder {
         // D3D11 immediate context is not thread-safe; the MFT will touch the
         // device from its own worker, so enable multithread protection.
         if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-            unsafe { let _ = mt.SetMultithreadProtected(true); };
+            unsafe {
+                let _ = mt.SetMultithreadProtected(true);
+            };
         }
 
         let (video_device, video_context, vp_enum, video_processor) =
@@ -386,9 +388,7 @@ impl GpuH264Encoder {
         let mut n = 0;
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            let event = match unsafe {
-                self.event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT)
-            } {
+            let event = match unsafe { self.event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(e) => e,
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -525,8 +525,12 @@ impl GpuH264Encoder {
 impl Drop for GpuH264Encoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
         debug!("GPU H.264 encoder dropped");
     }
@@ -544,9 +548,9 @@ fn create_video_processor(
     ID3D11VideoProcessorEnumerator,
     ID3D11VideoProcessor,
 )> {
-    let video_device: ID3D11VideoDevice = device
-        .cast()
-        .context("device does not expose ID3D11VideoDevice (need D3D11_CREATE_DEVICE_VIDEO_SUPPORT)")?;
+    let video_device: ID3D11VideoDevice = device.cast().context(
+        "device does not expose ID3D11VideoDevice (need D3D11_CREATE_DEVICE_VIDEO_SUPPORT)",
+    )?;
     let video_context: ID3D11VideoContext = context.cast().context("no ID3D11VideoContext")?;
 
     let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
@@ -682,7 +686,15 @@ unsafe fn try_codec(
     let mut result = None;
     for activate in activates.iter().flatten() {
         let name = friendly_name(activate);
-        match configure_encoder(activate, codec, device_manager, width, height, fps, bitrate_kbps) {
+        match configure_encoder(
+            activate,
+            codec,
+            device_manager,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+        ) {
             Ok(pair) => {
                 info!("Using {} encoder MFT: {}", codec.label(), name);
                 result = Some(pair);
@@ -788,7 +800,10 @@ unsafe fn configure_encoder(
 
     // Bind the D3D11 device manager (after types are negotiated).
     transform
-        .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, device_manager.as_raw() as usize)
+        .ProcessMessage(
+            MFT_MESSAGE_SET_D3D_MANAGER,
+            device_manager.as_raw() as usize,
+        )
         .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
 
     let event_gen: IMFMediaEventGenerator =
