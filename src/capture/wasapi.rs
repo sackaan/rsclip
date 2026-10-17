@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use log::{info, warn};
@@ -18,17 +18,55 @@ use windows::core::PROPVARIANT;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree, STGM_READ};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
 use super::audio::SharedAudioBuffer;
 
 pub(super) const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+const AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR: u32 = 0x4;
 
 /// WASAPI capture buffer length, in 100-ns units (200 ms). Capture is
 /// drained every ~10 ms; a generous buffer costs no latency that matters
 /// for a replay buffer and stops samples being lost when this thread is
 /// briefly starved by the game.
 const CAPTURE_BUFFER_HNS: i64 = 2_000_000;
+
+/// Wall-clock time at which a packet's first frame was captured.
+///
+/// WASAPI reports that moment as a QPC reading in 100-ns units. Using it
+/// (rather than when we happened to poll) keeps audio aligned to video
+/// even when this thread is delayed and drains several packets at once.
+/// Falls back to "now minus the packet length" if the timestamp is
+/// flagged bad or implausible.
+fn packet_start(qpc_100ns: u64, flags: u32, frames: u32, rate: u32) -> Instant {
+    let now = Instant::now();
+    let fallback = now
+        .checked_sub(Duration::from_secs_f64(frames as f64 / rate.max(1) as f64))
+        .unwrap_or(now);
+    if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR != 0 || qpc_100ns == 0 {
+        return fallback;
+    }
+    match qpc_now_100ns().checked_sub(qpc_100ns) {
+        Some(age) if age < 20_000_000 => now
+            .checked_sub(Duration::from_nanos(age * 100))
+            .unwrap_or(now),
+        _ => fallback,
+    }
+}
+
+/// Current QueryPerformanceCounter value in 100-ns units.
+fn qpc_now_100ns() -> u64 {
+    let (mut count, mut freq) = (0i64, 0i64);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut count);
+        let _ = QueryPerformanceFrequency(&mut freq);
+    }
+    if freq <= 0 {
+        return 0;
+    }
+    (count as i128 * 10_000_000 / freq as i128) as u64
+}
 
 /// Completion handler for ActivateAudioInterfaceAsync.
 #[windows::core::implement(IActivateAudioInterfaceCompletionHandler)]
@@ -215,21 +253,29 @@ pub(super) unsafe fn process_loopback_loop(
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut num_frames: u32 = 0;
             let mut flags: u32 = 0;
+            let mut qpc_pos: u64 = 0;
 
             if capture_client
-                .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
+                .GetBuffer(
+                    &mut data_ptr,
+                    &mut num_frames,
+                    &mut flags,
+                    None,
+                    Some(&mut qpc_pos),
+                )
                 .is_err()
             {
                 break;
             }
 
             let byte_count = num_frames as usize * block_align as usize;
+            let start = packet_start(qpc_pos, flags, num_frames, sample_rate);
 
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
-                buffer.lock().push_silence(byte_count);
+                buffer.lock().push_silence_at(byte_count, start);
             } else if !data_ptr.is_null() && byte_count > 0 {
                 let slice = std::slice::from_raw_parts(data_ptr, byte_count);
-                buffer.lock().push(slice);
+                buffer.lock().push_at(slice, start);
             }
 
             let _ = capture_client.ReleaseBuffer(num_frames);
@@ -444,25 +490,36 @@ pub(super) unsafe fn device_capture_loop(
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut num_frames: u32 = 0;
             let mut flags: u32 = 0;
+            let mut qpc_pos: u64 = 0;
 
             if capture_client
-                .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
+                .GetBuffer(
+                    &mut data_ptr,
+                    &mut num_frames,
+                    &mut flags,
+                    None,
+                    Some(&mut qpc_pos),
+                )
                 .is_err()
             {
                 break;
             }
 
             let byte_count = num_frames as usize * src_format.block_align as usize;
+            let start = packet_start(qpc_pos, flags, num_frames, src_format.sample_rate);
 
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
-                // Push silence in canonical format: num_frames * 2ch * 4 bytes/sample = 8 bytes/frame
-                let canonical_bytes = num_frames as usize * 8;
-                buffer.lock().push_silence(canonical_bytes);
+                // Silence in canonical format: 48 kHz stereo f32 = 8 bytes/frame.
+                let canonical_frames =
+                    num_frames as u64 * 48_000 / src_format.sample_rate.max(1) as u64;
+                buffer
+                    .lock()
+                    .push_silence_at(canonical_frames as usize * 8, start);
             } else if !data_ptr.is_null() && byte_count > 0 {
                 let slice = std::slice::from_raw_parts(data_ptr, byte_count);
                 let converted =
                     convert_to_canonical(slice, num_frames, &src_format, &mut resampler);
-                buffer.lock().push(&converted);
+                buffer.lock().push_at(&converted, start);
             }
 
             let _ = capture_client.ReleaseBuffer(num_frames);

@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -16,7 +16,7 @@ use log::{info, warn};
 
 use parking_lot::RwLock;
 
-use crate::encoding::buffer::{EncodedReplayBuffer, SharedEncodedBuffer};
+use crate::encoding::buffer::{EncodedReplayBuffer, SharedEncodedBuffer, PTS_HZ};
 use crate::encoding::config::EncoderConfig;
 
 use super::hw::ffmpeg_cmd;
@@ -53,6 +53,28 @@ pub struct LiveEncoder {
     hw_encoder: HwEncoder,
     /// Frame size the encoder was started with (always even).
     frame_size: (u32, u32),
+    /// Output frame rate (constant).
+    fps: u32,
+    /// Origin of the writer's frame clock, set when the first frame is
+    /// written: frame `n` is written at `writer_start + n / fps`.
+    writer_start: Arc<OnceLock<Instant>>,
+}
+
+/// Encoded video taken for a save, with the wall-clock interval it shows.
+pub(crate) struct VideoSnapshot {
+    /// MPEG-TS bytes, starting on a keyframe.
+    pub data: Vec<u8>,
+    /// When the first frame's content was captured.
+    pub start: Instant,
+    /// When the last frame stops being displayed.
+    pub end: Instant,
+}
+
+impl VideoSnapshot {
+    /// Length of the clip in seconds.
+    pub fn duration_secs(&self) -> f64 {
+        (self.end - self.start).as_secs_f64()
+    }
 }
 
 impl LiveEncoder {
@@ -77,6 +99,8 @@ impl LiveEncoder {
         let preview_frame: SharedPreviewFrame = Arc::new(parking_lot::Mutex::new(None));
 
         let fps = cfg.fps;
+        let writer_start = Arc::new(OnceLock::new());
+        let writer_start_w = writer_start.clone();
         let audio_bitrate_kbps = cfg.audio_bitrate_kbps;
         let frame_len = enc_width as usize * enc_height as usize * 4;
 
@@ -131,7 +155,10 @@ impl LiveEncoder {
                 let mut stdin = stdin;
                 let mut last_preview = Instant::now();
                 let mut last_frame_data: Option<Vec<u8>> = None;
-                let start_time = Instant::now();
+                // The frame clock starts when the first frame is written, so
+                // frame numbers (and therefore encoder PTS) map exactly onto
+                // wall time: frame `n` goes out at `start_time + n / fps`.
+                let mut start_time: Option<Instant> = None;
                 let mut frames_written: u64 = 0;
 
                 loop {
@@ -139,24 +166,27 @@ impl LiveEncoder {
                         break;
                     }
 
-                    let next_deadline = start_time
-                        + Duration::from_nanos((frames_written + 1) * 1_000_000_000 / fps as u64);
-                    let now = Instant::now();
-
-                    let wait = if now < next_deadline {
-                        next_deadline - now
-                    } else {
-                        Duration::ZERO
-                    };
-
-                    let got_frame = if wait > Duration::ZERO {
-                        match frame_rx.recv_timeout(wait) {
+                    let got_frame = match start_time {
+                        // Nothing to pace (or repeat) until the first frame.
+                        None => match frame_rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(raw_frame) => Some(raw_frame),
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        },
+                        Some(start) => {
+                            let next_deadline = start
+                                + Duration::from_nanos(frames_written * 1_000_000_000 / fps as u64);
+                            let wait = next_deadline.saturating_duration_since(Instant::now());
+                            if wait > Duration::ZERO {
+                                match frame_rx.recv_timeout(wait) {
+                                    Ok(raw_frame) => Some(raw_frame),
+                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                                }
+                            } else {
+                                frame_rx.try_recv().ok()
+                            }
                         }
-                    } else {
-                        frame_rx.try_recv().ok()
                     };
 
                     // Every frame — fresh or repeated — is a packed buffer of
@@ -183,6 +213,11 @@ impl LiveEncoder {
                     };
 
                     if let Some(data) = data {
+                        if start_time.is_none() {
+                            let now = Instant::now();
+                            start_time = Some(now);
+                            let _ = writer_start_w.set(now);
+                        }
                         if stdin.write_all(data).is_err() {
                             if running_w.load(Ordering::Relaxed) {
                                 warn!("FFmpeg stdin write failed — encoder may have crashed");
@@ -218,7 +253,7 @@ impl LiveEncoder {
                         Ok(n) => {
                             let _t =
                                 crate::metrics::Timer::start(crate::metrics::Stage::BufferPush);
-                            buffer_clone.write().push(buf[..n].to_vec());
+                            buffer_clone.write().push(&buf[..n]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => {
@@ -249,6 +284,8 @@ impl LiveEncoder {
             audio_bitrate_kbps,
             hw_encoder,
             frame_size: (enc_width, enc_height),
+            fps,
+            writer_start,
         })
     }
 
@@ -334,25 +371,40 @@ impl LiveEncoder {
         self.failed.load(Ordering::SeqCst)
     }
 
-    /// Snapshot the encoded buffer into a save request. Returns `None` if
-    /// nothing has been encoded yet.
+    /// Snapshot the encoded buffer together with the wall-clock interval
+    /// it covers, so audio can be cut to exactly the same moments. Returns
+    /// `None` until the first keyframe has been encoded.
+    pub(crate) fn snapshot(&self) -> Option<VideoSnapshot> {
+        let writer_start = *self.writer_start.get()?;
+        let snap = self.encoded_buffer.read().snapshot()?;
+        let (start, end) = frame_span_to_wall(
+            writer_start,
+            self.fps,
+            snap.base_pts,
+            snap.start_pts,
+            snap.end_pts,
+        );
+        Some(VideoSnapshot {
+            data: snap.data,
+            start,
+            end,
+        })
+    }
+
+    /// Package a snapshot and its matching audio for the save worker.
     pub(crate) fn save_request(
         &self,
+        video: VideoSnapshot,
         output_dir: &str,
         audio_wav: Option<Vec<u8>>,
-        video_duration_secs: f64,
-    ) -> Option<SaveRequest> {
-        let encoded_data = self.encoded_buffer.read().snapshot();
-        if encoded_data.is_empty() {
-            return None;
-        }
-        Some(SaveRequest {
-            encoded_data,
+    ) -> SaveRequest {
+        SaveRequest {
+            video_duration_secs: video.duration_secs(),
+            encoded_data: video.data,
             output_dir: output_dir.to_string(),
             audio_wav,
-            video_duration_secs,
             audio_bitrate_kbps: self.audio_bitrate_kbps,
-        })
+        }
     }
 
     /// Signal all worker threads to wind down. Idempotent. The encoded
@@ -366,6 +418,29 @@ impl Drop for LiveEncoder {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Map the PTS range of buffered frames to the wall-clock interval they
+/// show. The writer emits frame `n` at `writer_start + n / fps` carrying
+/// the newest captured image, and the encoder stamps it
+/// `base_pts + n * 90000 / fps`; the last frame stays on screen for one
+/// more frame period.
+fn frame_span_to_wall(
+    writer_start: Instant,
+    fps: u32,
+    base_pts: i64,
+    start_pts: i64,
+    end_pts: i64,
+) -> (Instant, Instant) {
+    let fps = fps.max(1) as f64;
+    let at = |pts: i64| {
+        let frame = ((pts - base_pts) as f64 * fps / PTS_HZ as f64)
+            .round()
+            .max(0.0);
+        writer_start + Duration::from_secs_f64(frame / fps)
+    };
+    let end = at(end_pts) + Duration::from_secs_f64(1.0 / fps);
+    (at(start_pts), end)
 }
 
 /// FFmpeg `-vf` value for scaling the `in_w`×`in_h` input to the configured
@@ -406,6 +481,19 @@ mod tests {
             audio_bitrate_kbps: 128,
             scale_filter: ScaleFilter::Lanczos,
         }
+    }
+
+    #[test]
+    fn frame_span_maps_pts_to_writer_clock() {
+        let t0 = Instant::now();
+        // 60 fps: 1500 ticks per frame. Frames 120..=299 buffered.
+        let (start, end) =
+            frame_span_to_wall(t0, 60, 126_000, 126_000 + 120 * 1500, 126_000 + 299 * 1500);
+        let ms = |i: Instant| (i - t0).as_secs_f64() * 1000.0;
+        assert!((ms(start) - 2000.0).abs() < 0.01);
+        assert!((ms(end) - 5000.0).abs() < 0.01);
+        // 180 frames -> exactly 3 s of clip.
+        assert!(((end - start).as_secs_f64() - 3.0).abs() < 1e-6);
     }
 
     #[test]
@@ -466,9 +554,11 @@ mod tests {
         enc.stop();
         std::thread::sleep(Duration::from_millis(300));
         assert!(!enc.has_failed(), "a requested stop is not a failure");
-        let req = enc
-            .save_request("unused", None, 1.0)
-            .expect("buffered output");
-        assert_eq!(req.encoded_data[0], 0x47, "MPEG-TS sync byte");
+        let snap = enc.snapshot().expect("buffered output");
+        assert_eq!(snap.data[0], 0x47, "MPEG-TS sync byte");
+        // ~1.5 s of frames were fed; the snapshot must start on a keyframe
+        // and its wall span must match the frames it holds.
+        let d = snap.duration_secs();
+        assert!(d > 0.5 && d < 3.0, "span {d}");
     }
 }

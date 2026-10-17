@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use log::{info, warn};
@@ -18,43 +18,28 @@ use super::wasapi;
 
 pub use wasapi::MicDevice;
 
+/// Gaps in delivery shorter than this are treated as timestamp jitter;
+/// longer ones (a silent source that stopped delivering, a capture overrun)
+/// are filled with silence so the sample timeline keeps matching wall time.
+const GAP_TOLERANCE: Duration = Duration::from_millis(30);
+
+/// Fixed-capacity ring of canonical f32 interleaved PCM, anchored to wall
+/// time: `end_time` is when the newest sample ends, and samples run back
+/// from there at the nominal rate.
 pub(super) struct AudioRingBuffer {
     data: Vec<u8>,
     write_pos: usize,
     filled: usize,
     sample_rate: u32,
-    // Source-format fields. The active save path (`AudioMixer::snapshot_mixed_wav`)
-    // assumes the canonical 48 kHz / stereo / f32 layout, so these are only
-    // read by `snapshot_wav` (covered by tests).
-    #[allow(dead_code)]
     channels: u16,
-    #[allow(dead_code)]
-    bits_per_sample: u16,
     block_align: u16,
-    #[allow(dead_code)]
-    is_float: bool,
-    /// Monotonic count of all bytes ever pushed (including silence).
-    /// Used with `capture_start` to compute the effective byte rate,
-    /// compensating for audio hardware clock drift — the same approach
-    /// OBS uses (sample-count based timing instead of system clock).
-    total_bytes_written: u64,
-    /// Wall-clock instant when the first audio data arrived.
-    capture_start: Option<Instant>,
-    /// Wall-clock instant of the most recent push. Measuring the rate up to
-    /// here (not up to "now") keeps it correct after capture stops, so a
-    /// stopped buffer can still be saved.
-    last_push: Option<Instant>,
+    /// Wall-clock time at which the newest buffered sample ends.
+    end_time: Option<Instant>,
 }
 
 impl AudioRingBuffer {
-    fn new(
-        max_seconds: u32,
-        sample_rate: u32,
-        channels: u16,
-        bits_per_sample: u16,
-        is_float: bool,
-    ) -> Self {
-        let block_align = channels * (bits_per_sample / 8);
+    fn new(max_seconds: u32, sample_rate: u32, channels: u16) -> Self {
+        let block_align = channels * 4;
         let bytes_per_sec = sample_rate as usize * block_align as usize;
         // +2 seconds margin (same as video buffer).
         let max_bytes = bytes_per_sec * (max_seconds as usize + 2);
@@ -65,160 +50,104 @@ impl AudioRingBuffer {
             filled: 0,
             sample_rate,
             channels,
-            bits_per_sample,
             block_align,
-            is_float,
-            total_bytes_written: 0,
-            capture_start: None,
-            last_push: None,
+            end_time: None,
         }
     }
 
-    /// Effective byte rate derived from actual capture timing.
-    ///
-    /// Audio hardware clocks drift from their nominal rate (e.g. a "48 kHz"
-    /// device might actually run at 47 999 Hz). Over long sessions this causes
-    /// audio/video desync. By dividing the total bytes the hardware delivered
-    /// by the wall-clock time elapsed we get the *real* rate, which we then
-    /// use when extracting a time-based snapshot from the ring buffer.
-    fn effective_bytes_per_sec(&self) -> f64 {
-        let nominal = self.sample_rate as f64 * self.block_align as f64;
-        if let (Some(start), Some(last)) = (self.capture_start, self.last_push) {
-            let elapsed = last.duration_since(start).as_secs_f64();
-            // Only trust the measurement after enough data has accumulated.
-            if elapsed >= 1.0 && self.total_bytes_written > nominal as u64 {
-                return self.total_bytes_written as f64 / elapsed;
+    fn bytes_to_duration(&self, bytes: usize) -> Duration {
+        let bytes_per_sec = self.sample_rate as f64 * self.block_align as f64;
+        Duration::from_secs_f64(bytes as f64 / bytes_per_sec)
+    }
+
+    /// Append PCM whose first sample was captured at `start`.
+    pub(super) fn push_at(&mut self, pcm: &[u8], start: Instant) {
+        self.fill_gap(start);
+        self.write(Some(pcm), pcm.len());
+        self.end_time = Some(start + self.bytes_to_duration(pcm.len()));
+    }
+
+    /// Append `count` bytes of silence starting at `start`.
+    pub(super) fn push_silence_at(&mut self, count: usize, start: Instant) {
+        self.fill_gap(start);
+        self.write(None, count);
+        self.end_time = Some(start + self.bytes_to_duration(count));
+    }
+
+    fn fill_gap(&mut self, start: Instant) {
+        let Some(end) = self.end_time else {
+            return;
+        };
+        let gap = start.saturating_duration_since(end);
+        if gap <= GAP_TOLERANCE {
+            return;
+        }
+        let bytes_per_sec = self.sample_rate as f64 * self.block_align as f64;
+        let block = self.block_align as usize;
+        let bytes = (gap.as_secs_f64() * bytes_per_sec) as usize / block * block;
+        self.write(None, bytes);
+    }
+
+    /// Write `len` bytes of `pcm` (or zeros when `None`) at the head.
+    fn write(&mut self, pcm: Option<&[u8]>, len: usize) {
+        let cap = self.data.len();
+        if cap == 0 || len == 0 {
+            return;
+        }
+        // Only the newest `cap` bytes can be kept.
+        let skip = len.saturating_sub(cap);
+        let len = len - skip;
+        let src = pcm.map(|p| &p[skip..skip + len]);
+
+        let first = len.min(cap - self.write_pos);
+        let (a, b) = (self.write_pos..self.write_pos + first, 0..len - first);
+        match src {
+            Some(src) => {
+                self.data[a].copy_from_slice(&src[..first]);
+                self.data[b].copy_from_slice(&src[first..]);
+            }
+            None => {
+                self.data[a].fill(0);
+                self.data[b].fill(0);
             }
         }
-        nominal
-    }
-
-    pub(super) fn push(&mut self, pcm: &[u8]) {
-        let cap = self.data.len();
-        if cap == 0 || pcm.is_empty() {
-            return;
-        }
-
-        let now = Instant::now();
-        self.capture_start.get_or_insert(now);
-        self.last_push = Some(now);
-        self.total_bytes_written += pcm.len() as u64;
-
-        let len = pcm.len();
-        if len >= cap {
-            // Data larger than buffer — keep only the last `cap` bytes.
-            self.data.copy_from_slice(&pcm[len - cap..]);
-            self.write_pos = 0;
-            self.filled = cap;
-            return;
-        }
-
-        let space_to_end = cap - self.write_pos;
-        if len <= space_to_end {
-            self.data[self.write_pos..self.write_pos + len].copy_from_slice(pcm);
-        } else {
-            self.data[self.write_pos..].copy_from_slice(&pcm[..space_to_end]);
-            self.data[..len - space_to_end].copy_from_slice(&pcm[space_to_end..]);
-        }
         self.write_pos = (self.write_pos + len) % cap;
         self.filled = (self.filled + len).min(cap);
     }
 
-    pub(super) fn push_silence(&mut self, count: usize) {
-        let cap = self.data.len();
-        if cap == 0 || count == 0 {
-            return;
-        }
-
-        let now = Instant::now();
-        self.capture_start.get_or_insert(now);
-        self.last_push = Some(now);
-        self.total_bytes_written += count as u64;
-
-        let len = count.min(cap);
-        let space_to_end = cap - self.write_pos;
-        if len <= space_to_end {
-            self.data[self.write_pos..self.write_pos + len].fill(0);
-        } else {
-            self.data[self.write_pos..].fill(0);
-            self.data[..len - space_to_end].fill(0);
-        }
-        self.write_pos = (self.write_pos + len) % cap;
-        self.filled = (self.filled + len).min(cap);
-    }
-
-    fn snapshot_pcm_f32(&self, seconds: f64) -> Vec<f32> {
-        if self.block_align == 0 || self.sample_rate == 0 {
-            return Vec::new();
-        }
-
-        let bytes_per_sec = self.effective_bytes_per_sec();
-        let requested = (seconds * bytes_per_sec) as usize;
-        let available = requested.min(self.filled);
-        let available = (available / self.block_align as usize) * self.block_align as usize;
-        if available == 0 {
-            return Vec::new();
-        }
-
-        let cap = self.data.len();
-        let start = if self.write_pos >= available {
-            self.write_pos - available
-        } else {
-            cap - (available - self.write_pos)
+    /// Interleaved samples covering exactly `[t0, t1)` of wall time at the
+    /// nominal rate. Moments the ring doesn't cover come back as silence.
+    fn span_f32(&self, t0: Instant, t1: Instant) -> Vec<f32> {
+        let rate = self.sample_rate as f64;
+        let ch = self.channels as usize;
+        let n = (t1.saturating_duration_since(t0).as_secs_f64() * rate).round() as usize;
+        let mut out = vec![0.0f32; n * ch];
+        let Some(end) = self.end_time else {
+            return out;
         };
-
-        let mut pcm_bytes = vec![0u8; available];
-        if start + available <= cap {
-            pcm_bytes.copy_from_slice(&self.data[start..start + available]);
+        let block = self.block_align as usize;
+        let cap_frames = self.data.len() / block;
+        let filled_frames = (self.filled / block) as i64;
+        let head = self.write_pos / block;
+        // Frames between t0 and the end of the newest sample (may be < 0).
+        let lead = if end >= t0 {
+            (end - t0).as_secs_f64() * rate
         } else {
-            let first = cap - start;
-            pcm_bytes[..first].copy_from_slice(&self.data[start..]);
-            pcm_bytes[first..].copy_from_slice(&self.data[..available - first]);
-        }
-
-        pcm_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    #[allow(dead_code)] // used by unit tests; kept as the natural counterpart to snapshot_pcm_f32
-    fn snapshot_wav(&self, seconds: f64) -> Vec<u8> {
-        if self.block_align == 0 || self.sample_rate == 0 {
-            return Vec::new();
-        }
-
-        let bytes_per_sec = self.effective_bytes_per_sec();
-        let requested = (seconds * bytes_per_sec) as usize;
-        let available = requested.min(self.filled);
-        let available = (available / self.block_align as usize) * self.block_align as usize;
-        if available == 0 {
-            return Vec::new();
-        }
-
-        let cap = self.data.len();
-        let start = if self.write_pos >= available {
-            self.write_pos - available
-        } else {
-            cap - (available - self.write_pos)
+            -(t0 - end).as_secs_f64() * rate
         };
-
-        let mut pcm = vec![0u8; available];
-        if start + available <= cap {
-            pcm.copy_from_slice(&self.data[start..start + available]);
-        } else {
-            let first = cap - start;
-            pcm[..first].copy_from_slice(&self.data[start..]);
-            pcm[first..].copy_from_slice(&self.data[..available - first]);
+        for (j, frame) in out.chunks_exact_mut(ch).enumerate() {
+            // How many frames back from the newest one covers this moment.
+            let back = (lead - j as f64).ceil() as i64;
+            if back < 1 || back > filled_frames {
+                continue;
+            }
+            let fi = (head + cap_frames - back as usize) % cap_frames;
+            let bytes = &self.data[fi * block..fi * block + block];
+            for (s, b) in frame.iter_mut().zip(bytes.chunks_exact(4)) {
+                *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
         }
-
-        build_wav(
-            &pcm,
-            self.sample_rate,
-            self.channels,
-            self.bits_per_sample,
-            self.is_float,
-        )
+        out
     }
 }
 
@@ -258,13 +187,7 @@ fn build_wav(
 pub(super) type SharedAudioBuffer = Arc<Mutex<AudioRingBuffer>>;
 
 fn new_canonical_buffer(buffer_seconds: u32) -> SharedAudioBuffer {
-    Arc::new(Mutex::new(AudioRingBuffer::new(
-        buffer_seconds,
-        48000,
-        2,
-        32,
-        true,
-    )))
+    Arc::new(Mutex::new(AudioRingBuffer::new(buffer_seconds, 48000, 2)))
 }
 
 /// The kind of audio source backing a channel.
@@ -359,8 +282,12 @@ impl AudioChannel {
         Ok(())
     }
 
-    fn snapshot_pcm_f32(&self, seconds: f64) -> Vec<f32> {
-        self.buffer.lock().snapshot_pcm_f32(seconds)
+    fn span_f32(&self, t0: Instant, t1: Instant) -> Vec<f32> {
+        self.buffer.lock().span_f32(t0, t1)
+    }
+
+    fn has_audio(&self) -> bool {
+        self.buffer.lock().end_time.is_some()
     }
 
     fn stop(&self) {
@@ -523,60 +450,48 @@ impl AudioMixer {
             .find(|c| c.kind == ChannelKind::Microphone)
     }
 
-    /// Mix all active channels into a single WAV.
-    ///
-    /// Shorter channels are right-aligned so audio aligns to "now" at the
-    /// end of the clip. Returns an empty vector if no channel has audio.
-    pub fn snapshot_mixed_wav(&self, seconds: f64) -> Vec<u8> {
-        let active: Vec<_> = self.channels.iter().filter(|c| c.volume > 0.0).collect();
-
+    /// Mix all active channels over the wall-clock interval `[t0, t1)` into
+    /// a single WAV, so the audio lines up with video covering the same
+    /// moments. Parts a channel didn't capture are silent. Returns an empty
+    /// vector if no active channel has captured anything.
+    pub fn snapshot_mixed_wav_span(&self, t0: Instant, t1: Instant) -> Vec<u8> {
+        let active: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|c| c.volume > 0.0 && c.has_audio())
+            .collect();
         if active.is_empty() {
             return Vec::new();
         }
 
-        if active.len() == 1 {
-            let ch = active[0];
-            let pcm = ch.snapshot_pcm_f32(seconds);
-            if pcm.is_empty() {
-                return Vec::new();
-            }
-            let bytes = if (ch.volume - 1.0).abs() < f32::EPSILON {
-                f32_slice_to_bytes(&pcm)
+        let mut mixed: Vec<f32> = Vec::new();
+        for ch in active {
+            let pcm = ch.span_f32(t0, t1);
+            if mixed.is_empty() {
+                mixed = pcm.iter().map(|&s| s * ch.volume).collect();
             } else {
-                let scaled: Vec<f32> = pcm
-                    .iter()
-                    .map(|&s| (s * ch.volume).clamp(-1.0, 1.0))
-                    .collect();
-                f32_slice_to_bytes(&scaled)
-            };
-            return build_wav(&bytes, 48000, 2, 32, true);
-        }
-
-        let channel_pcms: Vec<(f32, Vec<f32>)> = active
-            .iter()
-            .map(|ch| (ch.volume, ch.snapshot_pcm_f32(seconds)))
-            .collect();
-
-        let max_len = channel_pcms.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
-        if max_len == 0 {
-            return Vec::new();
-        }
-
-        let mut mixed = vec![0.0f32; max_len];
-
-        for (volume, pcm) in &channel_pcms {
-            let offset = max_len - pcm.len();
-            for (i, &sample) in pcm.iter().enumerate() {
-                mixed[offset + i] += sample * volume;
+                for (m, s) in mixed.iter_mut().zip(&pcm) {
+                    *m += s * ch.volume;
+                }
             }
         }
-
         for s in &mut mixed {
             *s = s.clamp(-1.0, 1.0);
         }
 
         let bytes = f32_slice_to_bytes(&mixed);
         build_wav(&bytes, 48000, 2, 32, true)
+    }
+
+    /// Mix the last `seconds` up to now. See [`snapshot_mixed_wav_span`].
+    ///
+    /// [`snapshot_mixed_wav_span`]: AudioMixer::snapshot_mixed_wav_span
+    pub fn snapshot_mixed_wav(&self, seconds: f64) -> Vec<u8> {
+        let now = Instant::now();
+        let start = now
+            .checked_sub(Duration::from_secs_f64(seconds.max(0.0)))
+            .unwrap_or(now);
+        self.snapshot_mixed_wav_span(start, now)
     }
 
     /// Stop every channel's capture thread. Idempotent.
@@ -613,6 +528,17 @@ fn f32_slice_to_bytes(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    const RATE: u32 = 48000;
+
+    /// Stereo f32 PCM of `frames` frames, every sample = `v`.
+    fn pcm(frames: usize, v: f32) -> Vec<u8> {
+        f32_slice_to_bytes(&vec![v; frames * 2])
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     #[test]
     fn test_build_wav_header_pcm() {
         let pcm = vec![0u8; 100];
@@ -648,68 +574,228 @@ mod tests {
     }
 
     #[test]
-    fn test_ring_buffer_push_and_snapshot() {
-        let mut buf = AudioRingBuffer::new(1, 48000, 2, 32, true);
-        let block = vec![1u8; 384]; // 1 frame = 8 bytes, 48 frames
-        buf.push(&block);
-        let wav = buf.snapshot_wav(0.01);
-        assert!(!wav.is_empty());
-        assert_eq!(&wav[0..4], b"RIFF");
+    fn span_returns_exact_length_and_content() {
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(5, RATE, 2);
+        buf.push_at(&pcm(48_000, 0.5), t0); // 1 s ending at t0 + 1 s
+        let out = buf.span_f32(t0 + ms(250), t0 + ms(750));
+        assert_eq!(out.len(), 24_000 * 2);
+        assert!(out.iter().all(|&s| s == 0.5));
     }
 
     #[test]
-    fn test_ring_buffer_wraps() {
-        // Small buffer: 1 second at 100 Hz, mono, 8-bit = ~(100+2)*1 = 102 bytes
-        let mut buf = AudioRingBuffer::new(1, 100, 1, 8, false);
-        let cap = buf.data.len();
-        // Fill past capacity
-        let data = vec![42u8; cap + 10];
-        buf.push(&data);
-        assert_eq!(buf.filled, cap);
+    fn span_pads_uncovered_time_with_silence() {
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(5, RATE, 2);
+        buf.push_at(&pcm(48_000, 0.5), t0 + ms(1000)); // covers 1 s..2 s
+        let out = buf.span_f32(t0, t0 + ms(3000));
+        assert_eq!(out.len(), 144_000 * 2);
+        let sec = |i: usize| &out[i * 96_000..(i + 1) * 96_000];
+        assert!(sec(0).iter().all(|&s| s == 0.0), "before capture");
+        assert!(sec(1).iter().all(|&s| s == 0.5), "captured");
+        assert!(sec(2).iter().all(|&s| s == 0.0), "after capture stopped");
     }
 
     #[test]
-    fn test_ring_buffer_push_silence() {
-        let mut buf = AudioRingBuffer::new(1, 48000, 2, 32, true);
-        buf.push_silence(384);
-        assert_eq!(buf.filled, 384);
-        // All pushed bytes should be zero
-        let wav = buf.snapshot_wav(0.01);
-        // Data portion (after 44-byte header) should be all zeros
-        for &b in &wav[44..] {
-            assert_eq!(b, 0);
+    fn delivery_gap_is_filled_so_later_audio_keeps_its_time() {
+        // A source that goes quiet and stops delivering for 2 s must not
+        // pull the audio after the gap 2 s earlier.
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(10, RATE, 2);
+        buf.push_at(&pcm(48_000, 0.25), t0);
+        buf.push_at(&pcm(48_000, 0.75), t0 + ms(3000));
+        let out = buf.span_f32(t0, t0 + ms(4000));
+        let at = |sec: f64| out[(sec * 48_000.0) as usize * 2];
+        assert_eq!(at(0.5), 0.25);
+        assert_eq!(at(2.0), 0.0);
+        assert_eq!(at(3.5), 0.75);
+    }
+
+    #[test]
+    fn small_jitter_does_not_insert_silence() {
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(5, RATE, 2);
+        for i in 0..100u64 {
+            // 10 ms packets, stamped up to 5 ms late.
+            buf.push_at(&pcm(480, 1.0), t0 + ms(i * 10 + (i % 3) * 2));
         }
+        assert_eq!(buf.filled, 48_000 * 8);
     }
 
     #[test]
-    fn test_snapshot_pcm_f32() {
-        let mut buf = AudioRingBuffer::new(1, 48000, 2, 32, true);
-        // Push a known f32 value (0.5) as 1 stereo frame = 8 bytes.
-        let val: f32 = 0.5;
-        let bytes = val.to_le_bytes();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&bytes); // L
-        frame.extend_from_slice(&bytes); // R
-        buf.push(&frame);
-
-        let pcm = buf.snapshot_pcm_f32(0.01);
-        assert_eq!(pcm.len(), 2); // 1 frame = 2 samples
-        assert!((pcm[0] - 0.5).abs() < f32::EPSILON);
-        assert!((pcm[1] - 0.5).abs() < f32::EPSILON);
+    fn ring_wraps_and_keeps_newest() {
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(1, RATE, 2); // 3 s capacity
+        for i in 0..5u64 {
+            buf.push_at(&pcm(48_000, i as f32), t0 + ms(i * 1000));
+        }
+        assert_eq!(buf.filled, buf.data.len());
+        let out = buf.span_f32(t0 + ms(2000), t0 + ms(5000));
+        assert_eq!(out[0], 2.0);
+        assert_eq!(out[96_000], 3.0);
+        assert_eq!(out[out.len() - 1], 4.0);
     }
 
     #[test]
-    fn test_effective_rate_frozen_after_capture_stops() {
-        let mut buf = AudioRingBuffer::new(5, 48000, 2, 32, true);
-        // Two seconds of audio delivered over exactly two seconds.
-        buf.push(&vec![0u8; 2 * 384_000]);
-        let start = Instant::now() - std::time::Duration::from_secs(10);
-        buf.capture_start = Some(start);
-        buf.last_push = Some(start + std::time::Duration::from_secs(2));
-        // Capture stopped 8 s ago; the rate must not decay with wall time.
-        let rate = buf.effective_bytes_per_sec();
-        assert!((rate - 384_000.0).abs() < 1.0, "rate {rate}");
-        assert_eq!(buf.snapshot_pcm_f32(1.0).len(), 96_000);
+    fn silence_packets_advance_time() {
+        let t0 = Instant::now();
+        let mut buf = AudioRingBuffer::new(5, RATE, 2);
+        buf.push_silence_at(48_000 * 8, t0);
+        buf.push_at(&pcm(48_000, 0.5), t0 + ms(1000));
+        let out = buf.span_f32(t0, t0 + ms(2000));
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[out.len() - 1], 0.5);
+        assert_eq!(buf.filled, 2 * 48_000 * 8);
+    }
+
+    #[test]
+    fn mixer_aligns_channels_by_wall_time() {
+        let t0 = Instant::now();
+        let mut mixer = AudioMixer::new(5);
+        for (vol, start, v) in [(1.0, 0u64, 0.25f32), (0.5, 1000, 0.5)] {
+            let buffer = new_canonical_buffer(5);
+            buffer.lock().push_at(&pcm(48_000, v), t0 + ms(start));
+            mixer.channels.push(AudioChannel {
+                kind: ChannelKind::Microphone,
+                volume: vol,
+                running: Arc::new(AtomicBool::new(false)),
+                buffer,
+                thread: None,
+            });
+        }
+        let wav = mixer.snapshot_mixed_wav_span(t0, t0 + ms(2000));
+        let samples: Vec<f32> = wav[44..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(samples.len(), 96_000 * 2);
+        assert_eq!(samples[0], 0.25); // first channel only
+        assert_eq!(samples[samples.len() - 1], 0.25); // second, at half volume
+    }
+
+    #[test]
+    fn mixer_without_captured_audio_returns_empty() {
+        let mixer = AudioMixer::new(5);
+        let now = Instant::now();
+        assert!(mixer
+            .snapshot_mixed_wav_span(now, now + ms(1000))
+            .is_empty());
+    }
+
+    /// Whole save pipeline, A/V sync: a white flash in the video and a click
+    /// in the audio happen at the same wall-clock moment; in the saved MP4
+    /// they must land within ~2 frames of each other. Uses the real encoder,
+    /// TS ring and remux. Opt-in: `cargo test -- --ignored av_sync`.
+    #[test]
+    #[ignore]
+    fn av_sync_flash_and_click_line_up_in_saved_clip() {
+        use crate::encoding::config::{EncoderConfig, RateControl, ScaleFilter, X264Preset};
+        use crate::encoding::encoder::{LiveEncoder, RawFrame};
+        use crate::encoding::hw::ffmpeg_cmd;
+
+        const FPS: u32 = 60;
+        let enc = LiveEncoder::start(EncoderConfig {
+            width: 320,
+            height: 240,
+            fps: FPS,
+            buffer_seconds: 30,
+            output_width: 320,
+            output_height: 240,
+            rate_control: RateControl::Quality,
+            crf: 23,
+            video_bitrate_kbps: 6000,
+            x264_preset: X264Preset::Veryfast,
+            audio_bitrate_kbps: 128,
+            scale_filter: ScaleFilter::Lanczos,
+        })
+        .expect("ffmpeg available");
+
+        let mut mixer = AudioMixer::new(30);
+        let ring = new_canonical_buffer(30);
+        mixer.channels.push(AudioChannel {
+            kind: ChannelKind::Game,
+            volume: 1.0,
+            running: Arc::new(AtomicBool::new(false)),
+            buffer: ring.clone(),
+            thread: None,
+        });
+
+        let t0 = Instant::now();
+        let flash = t0 + ms(1500);
+        let flash_end = flash + ms(500);
+        let lit = |t: Instant| t >= flash && t < flash_end;
+        let tx = enc.frame_sender();
+        let mut audio_end = t0;
+        while audio_end < t0 + ms(4000) {
+            std::thread::sleep(Duration::from_secs_f64(1.0 / FPS as f64));
+            let now = Instant::now();
+            let level = if lit(now) { 255 } else { 0 };
+            let _ = tx.try_send(RawFrame {
+                data: vec![level; 320 * 240 * 4],
+                width: 320,
+                height: 240,
+            });
+            let frames = ((now - audio_end).as_secs_f64() * RATE as f64) as usize;
+            let samples: Vec<f32> = (0..frames)
+                .flat_map(|i| {
+                    let t = audio_end + Duration::from_secs_f64(i as f64 / RATE as f64);
+                    let v = if lit(t) { 0.8 } else { 0.0 };
+                    [v, v]
+                })
+                .collect();
+            ring.lock()
+                .push_at(&f32_slice_to_bytes(&samples), audio_end);
+            audio_end += Duration::from_secs_f64(frames as f64 / RATE as f64);
+        }
+
+        let video = enc.snapshot().expect("encoded video");
+        let wav = mixer.snapshot_mixed_wav_span(video.start, video.end);
+        let dir = std::env::temp_dir().join(format!("rsclip_avsync_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let request = enc.save_request(video, &dir.to_string_lossy(), Some(wav));
+        crate::encoding::remux::remux_to_mp4(&request).expect("remux");
+        let clip = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        let out = ffmpeg_cmd()
+            .args(["-hide_banner", "-i"])
+            .arg(&clip)
+            .args([
+                "-vf",
+                "blackdetect=d=0.01:pix_th=0.5",
+                "-af",
+                "silencedetect=n=-30dB:d=0.01",
+            ])
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        let first = |key: &str| -> f64 {
+            let i = log.find(key).unwrap_or_else(|| {
+                panic!(
+                    "no {key} in:
+{log}"
+                )
+            });
+            log[i + key.len()..]
+                .split(|c: char| c.is_whitespace() || c == '|')
+                .find(|s| !s.is_empty())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let video_flash = first("black_end:");
+        let audio_click = first("silence_end:");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("flash at {video_flash:.3}s, click at {audio_click:.3}s");
+        assert!(
+            (video_flash - audio_click).abs() <= 2.0 / FPS as f64 + 0.005,
+            "A/V offset {:.1} ms",
+            (audio_click - video_flash) * 1000.0
+        );
     }
 
     #[test]

@@ -593,18 +593,18 @@ impl ClipperApp {
         }
 
         info!("Saving clip");
-        let video_secs = encoder.encoded_buffer().read().duration_secs();
-        let audio_wav = self
-            .audio_mixer
-            .as_ref()
-            .map(|m| m.snapshot_mixed_wav(video_secs))
-            .filter(|w| !w.is_empty());
-
-        let Some(request) = encoder.save_request(&self.settings.output_dir, audio_wav, video_secs)
-        else {
+        let Some(video) = encoder.snapshot() else {
             self.status_msg = StatusMessage::warning("Buffer empty");
             return;
         };
+        // Cut audio to exactly the wall-clock moments the video shows.
+        let audio_wav = self
+            .audio_mixer
+            .as_ref()
+            .map(|m| m.snapshot_mixed_wav_span(video.start, video.end))
+            .filter(|w| !w.is_empty());
+        info!("Clip spans {:.2}s of video", video.duration_secs());
+        let request = encoder.save_request(video, &self.settings.output_dir, audio_wav);
 
         let tx = self.save_result_tx.clone();
         let spawned = std::thread::Builder::new()
