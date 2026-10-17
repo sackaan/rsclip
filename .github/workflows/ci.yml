@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # RSClip is Windows-only (Windows Graphics Capture, WASAPI, Media Foundation).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (metrics feature)
+        run: cargo clippy --all-targets --features metrics -- -D warnings
+
+      # Unit tests only. Tests that drive a real FFmpeg are #[ignore]d; run
+      # them locally with `cargo test -- --ignored` (FFmpeg on PATH).
+      - name: Test
+        run: cargo test
+
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Security advisories (RustSec)
+        run: cargo deny check advisories
