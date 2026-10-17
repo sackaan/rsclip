@@ -181,21 +181,57 @@ mod tests {
         assert!(raw.working_set > 0, "working set should be non-zero");
     }
 
+    /// CPU time consumed by the calling thread, in 100-ns units.
+    #[cfg(windows)]
+    fn thread_cpu_100ns() -> u64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let [mut c, mut e, mut k, mut u] = [FILETIME::default(); 4];
+        unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u).unwrap() };
+        filetime_100ns(k) + filetime_100ns(u)
+    }
+
+    // The sampler reports whole-process CPU, and the test harness runs other
+    // tests on other threads at the same time, so "one busy thread" is not
+    // an upper bound. Check against bounds that hold regardless: the process
+    // used at least what this thread used, and no more than every core.
     #[test]
     fn tick_reports_plausible_cpu() {
         let mut s = Sampler::new();
-        // Burn a little CPU so the delta is not pure noise.
+        let before = read_raw().expect("process counters readable");
+        #[cfg(windows)]
+        let thread_before = thread_cpu_100ns();
+
         let mut acc = 0u64;
-        let spin_until = Instant::now() + std::time::Duration::from_millis(50);
+        let spin_until = Instant::now() + std::time::Duration::from_millis(200);
         while Instant::now() < spin_until {
             acc = acc.wrapping_add(1);
         }
         assert!(acc > 0);
 
+        let after = read_raw().expect("process counters readable");
+        let process_delta = after.cpu_100ns - before.cpu_100ns;
+        #[cfg(windows)]
+        {
+            let thread_delta = thread_cpu_100ns() - thread_before;
+            // Both clocks tick at the scheduler quantum (~15.6 ms), so allow
+            // one quantum of quantisation error.
+            let quantum = 160_000;
+            assert!(thread_delta > 0, "spinning thread used no CPU");
+            assert!(
+                process_delta + quantum >= thread_delta,
+                "process {process_delta} < thread {thread_delta}"
+            );
+        }
+
         let r = s.tick().expect("tick");
         assert!(r.cpu_pct_core > 0.0, "expected CPU usage, got {r:?}");
-        // One busy thread cannot exceed one core by much.
-        assert!(r.cpu_pct_core < 200.0, "implausible reading: {r:?}");
+        // Physically impossible to exceed every logical core (5% slack for
+        // quantisation over a short window).
+        assert!(
+            r.cpu_pct_core <= s.cores() * 100.0 * 1.05 + 10.0,
+            "implausible reading: {r:?}"
+        );
         assert!(r.working_set_mb > 0.0);
         assert!(r.cpu_pct_machine <= r.cpu_pct_core + f64::EPSILON);
     }
