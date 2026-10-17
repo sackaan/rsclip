@@ -392,7 +392,7 @@ impl ClipperApp {
         self.audio_mixer = None;
         self.dropped_frames.store(0, Ordering::Relaxed);
 
-        let encoder = match LiveEncoder::start(self.encoder_config(win.width, win.height)) {
+        let encoder = match self.start_encoder(win.width, win.height) {
             Ok(e) => e,
             Err(e) => {
                 error!("Failed to start live encoder: {}", e);
@@ -476,14 +476,63 @@ impl ClipperApp {
         }
     }
 
-    /// Detect an FFmpeg crash while recording: stop capturing into a dead
-    /// encoder and tell the user, keeping what was already buffered.
+    /// Start an encoder for a `width`×`height` source, honouring a
+    /// session-wide fallback to libx264.
+    fn start_encoder(&self, width: u32, height: u32) -> anyhow::Result<LiveEncoder> {
+        let cfg = self.encoder_config(width, height);
+        if self.force_software_encoder {
+            LiveEncoder::start_with(cfg, encoder::HwEncoder::Software)
+        } else {
+            LiveEncoder::start(cfg)
+        }
+    }
+
+    /// Detect an FFmpeg crash while recording. A hardware encoder that dies
+    /// before producing any video (driver too old, unsupported size) is
+    /// replaced by libx264 transparently; any other crash stops capturing
+    /// into the dead encoder and tells the user, keeping what was buffered.
     pub(super) fn check_encoder_health(&mut self) {
         if self.capture_handle.is_none() {
             return;
         }
-        if !self.live_encoder.as_ref().is_some_and(|e| e.has_failed()) {
+        let Some(enc) = self.live_encoder.as_ref() else {
             return;
+        };
+        if !enc.has_failed() {
+            return;
+        }
+        let hw = enc.hw_encoder();
+        let (width, height) = enc.frame_size();
+        if hw != encoder::HwEncoder::Software && enc.encoded_buffer().read().is_empty() {
+            warn!(
+                "{} failed to start; falling back to libx264",
+                hw.display_name()
+            );
+            self.force_software_encoder = true;
+            if let Some(handle) = self.capture_handle.take() {
+                handle.stop();
+            }
+            let restarted = self
+                .active_window
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("RuneLite window lost"))
+                .and_then(|win| {
+                    let enc = self.start_encoder(width, height)?;
+                    let handle = self.start_encoder_capture(&win, &enc)?;
+                    Ok((enc, handle))
+                });
+            match restarted {
+                Ok((enc, handle)) => {
+                    self.live_encoder = Some(enc);
+                    self.capture_handle = Some(handle);
+                    self.status_msg = StatusMessage::warning(format!(
+                        "{} unavailable — recording with x264",
+                        hw.display_name()
+                    ));
+                    return;
+                }
+                Err(e) => error!("libx264 fallback failed: {}", e),
+            }
         }
         error!("Encoder stopped unexpectedly; recording halted");
         self.stop_recording_internal();

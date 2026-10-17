@@ -78,11 +78,19 @@ impl VideoSnapshot {
 }
 
 impl LiveEncoder {
-    /// Spawn FFmpeg and the supporting threads. Returns once the child is
-    /// running and ready to receive frames on the [`frame_sender`].
+    /// Spawn FFmpeg with the best detected encoder. See [`start_with`].
+    ///
+    /// [`start_with`]: LiveEncoder::start_with
+    pub fn start(cfg: EncoderConfig) -> anyhow::Result<Self> {
+        Self::start_with(cfg, detect_best_encoder())
+    }
+
+    /// Spawn FFmpeg using `encoder` and the supporting threads. Returns once
+    /// the child is running and ready to receive frames on the
+    /// [`frame_sender`].
     ///
     /// [`frame_sender`]: LiveEncoder::frame_sender
-    pub fn start(cfg: EncoderConfig) -> anyhow::Result<Self> {
+    pub fn start_with(cfg: EncoderConfig, encoder: HwEncoder) -> anyhow::Result<Self> {
         let enc_width = cfg.width & !1;
         let enc_height = cfg.height & !1;
         anyhow::ensure!(
@@ -107,7 +115,7 @@ impl LiveEncoder {
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<RawFrame>(2);
         let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(RECYCLE_DEPTH);
 
-        let mut hw_encoder = detect_best_encoder();
+        let mut hw_encoder = encoder;
         let mut child = match Self::start_ffmpeg(enc_width, enc_height, &cfg, &hw_encoder) {
             Ok(c) => c,
             Err(e) if hw_encoder != HwEncoder::Software => {
@@ -516,6 +524,53 @@ mod tests {
         assert!(f.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2"));
         assert!(f.contains(BT709) && f.ends_with(BT709_TAGS));
         assert!(!f.contains(char::is_whitespace), "{f}");
+    }
+
+    /// A hardware encoder that cannot open (NVENC rejects frames below its
+    /// minimum size) must surface as "failed with nothing buffered", the
+    /// signal the UI uses to fall back to libx264. NVIDIA-only; opt-in:
+    /// `cargo test -- --ignored hw_open_failure`.
+    #[test]
+    #[ignore]
+    fn hw_open_failure_is_reported_with_empty_buffer() {
+        if detect_best_encoder() != HwEncoder::Nvenc {
+            eprintln!("skipped: NVENC not available");
+            return;
+        }
+        let mut c = cfg(64, 48);
+        c.width = 64;
+        c.height = 48;
+        let enc = LiveEncoder::start_with(c, HwEncoder::Nvenc).unwrap();
+        let tx = enc.frame_sender();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !enc.has_failed() && Instant::now() < deadline {
+            let _ = tx.try_send(RawFrame {
+                data: vec![0; 64 * 48 * 4],
+                width: 64,
+                height: 48,
+            });
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(enc.has_failed());
+        assert!(enc.encoded_buffer().read().is_empty());
+
+        // The fallback the UI performs: same size, libx264.
+        let mut c = cfg(64, 48);
+        c.width = 64;
+        c.height = 48;
+        let sw = LiveEncoder::start_with(c, HwEncoder::Software).unwrap();
+        let tx = sw.frame_sender();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sw.encoded_buffer().read().is_empty() && Instant::now() < deadline {
+            let _ = tx.try_send(RawFrame {
+                data: vec![0; 64 * 48 * 4],
+                width: 64,
+                height: 48,
+            });
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(!sw.has_failed());
+        assert!(!sw.encoded_buffer().read().is_empty());
     }
 
     /// End-to-end check against a real FFmpeg: feed frames, confirm encoded

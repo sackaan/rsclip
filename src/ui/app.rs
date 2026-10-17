@@ -7,8 +7,8 @@ use log::{error, info, warn};
 
 use crate::capture::audio::{AudioMixer, MicDevice};
 use crate::capture::cs2_capture::Cs2CaptureHandle;
-use crate::capture::sessions::AudioSession;
 use crate::capture::screen::CaptureHandle;
+use crate::capture::sessions::AudioSession;
 use crate::encoding::config::EncoderConfig;
 use crate::encoding::encoder::{self, LiveEncoder, SharedPreviewFrame};
 use crate::encoding::gpu_buffer::SharedAuBuffer;
@@ -67,6 +67,9 @@ pub struct ClipperApp {
     pub(super) status_msg: StatusMessage,
     pub(super) ffmpeg_available: bool,
     pub(super) is_saving: Arc<AtomicBool>,
+    /// Set when the detected hardware encoder failed to start during this
+    /// session; later recordings go straight to libx264.
+    pub(super) force_software_encoder: bool,
 
     pub(super) show_console: bool,
     pub(super) screen: Screen,
@@ -167,6 +170,7 @@ impl ClipperApp {
             },
             ffmpeg_available,
             is_saving: Arc::new(AtomicBool::new(false)),
+            force_software_encoder: false,
 
             show_console: false,
             screen: Screen::Main,
