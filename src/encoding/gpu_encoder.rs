@@ -204,11 +204,13 @@ impl GpuH264Encoder {
 
     /// SPS/PPS (or VPS/SPS/PPS for HEVC) bytes to prepend before the first
     /// access unit when saving a clip (so a cut at an IDR decodes standalone).
+    #[allow(dead_code)] // CS2 path reads the header via the AU buffer today.
     pub fn sequence_header(&self) -> &[u8] {
         &self.sequence_header
     }
 
     /// Which codec the encoder settled on (H.264 or HEVC).
+    #[allow(dead_code)] // CS2 path reads the codec via the AU buffer today.
     pub fn codec(&self) -> VideoCodec {
         self.codec
     }

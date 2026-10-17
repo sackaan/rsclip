@@ -25,6 +25,10 @@
 //! Results stream to a CSV per run plus a final percentile dump; see
 //! [`report::run_dir`] for where they land.
 
+// With the feature off the call sites compile to no-ops, leaving the
+// collectors themselves unused by design.
+#![cfg_attr(not(feature = "metrics"), allow(dead_code))]
+
 pub mod alloc;
 pub mod proc;
 pub mod report;
@@ -309,6 +313,7 @@ pub fn percentiles(stage: Stage) -> Vec<(f64, u64)> {
 ///
 /// Call after warm-up so start-up allocations and first-frame encoder
 /// negotiation do not pollute the steady-state numbers.
+#[allow(dead_code)] // Not wired to a trigger yet; public for benchmark runs.
 pub fn reset() {
     #[cfg(feature = "metrics")]
     imp::registry().reset();
@@ -383,6 +388,7 @@ mod imp {
                 .collect()
         }
 
+        #[allow(dead_code)] // Only reached through `metrics::reset`.
         pub(super) fn reset(&self) {
             for s in &self.stages {
                 s.lock().reset();

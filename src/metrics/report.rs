@@ -32,6 +32,7 @@ pub struct Reporter {
 impl Reporter {
     /// Stop sampling and write the end-of-run summary. Returns the summary
     /// file path when one was written.
+    #[allow(dead_code)] // `main` relies on Drop; kept for explicit shutdown.
     pub fn stop(mut self) -> Option<PathBuf> {
         #[cfg(feature = "metrics")]
         {
