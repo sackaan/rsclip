@@ -317,9 +317,7 @@ impl LiveEncoder {
             cmd.arg(arg);
         }
 
-        if let Some(filter) = scale_filter(enc_width, enc_height, cfg) {
-            cmd.args(["-vf", &filter]);
-        }
+        cmd.args(["-vf", &video_filter(enc_width, enc_height, cfg)]);
 
         cmd.args(["-pix_fmt", encoder.pix_fmt()])
             .args(["-g", &gop])
@@ -443,22 +441,28 @@ fn frame_span_to_wall(
     (at(start_pts), end)
 }
 
-/// FFmpeg `-vf` value for scaling the `in_w`×`in_h` input to the configured
-/// output size, or `None` when no scaling is needed. Scaling preserves the
-/// source aspect ratio and pads with black instead of stretching.
-fn scale_filter(in_w: u32, in_h: u32, cfg: &EncoderConfig) -> Option<String> {
+/// Colour conversion applied to every frame: BGRA is converted to
+/// limited-range BT.709 YUV and the stream is tagged as such. Without this
+/// swscale uses BT.601 and leaves the stream untagged, so players that
+/// assume BT.709 for HD content shift hues.
+const BT709: &str = "out_color_matrix=bt709:out_range=tv";
+const BT709_TAGS: &str =
+    "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv";
+
+/// FFmpeg `-vf` chain for an `in_w`×`in_h` input: optional scaling to the
+/// configured output size (aspect ratio kept, padded with black instead of
+/// stretched) plus BT.709 colour conversion and tagging.
+fn video_filter(in_w: u32, in_h: u32, cfg: &EncoderConfig) -> String {
     let out_w = cfg.output_width & !1;
     let out_h = cfg.output_height & !1;
     if out_w == 0 || out_h == 0 || (out_w == in_w && out_h == in_h) {
-        return None;
+        return format!("scale={BT709},{BT709_TAGS}");
     }
-    Some(format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags={f},\
-         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
-        w = out_w,
-        h = out_h,
-        f = cfg.scale_filter.as_str()
-    ))
+    let (w, h, f) = (out_w, out_h, cfg.scale_filter.as_str());
+    format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags={f}:{BT709},\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,{BT709_TAGS}"
+    )
 }
 
 #[cfg(test)]
@@ -497,18 +501,21 @@ mod tests {
     }
 
     #[test]
-    fn native_output_has_no_scale_filter() {
-        assert_eq!(scale_filter(764, 502, &cfg(764, 502)), None);
+    fn native_output_only_converts_colour() {
+        let expected = format!("scale={BT709},{BT709_TAGS}");
+        assert_eq!(video_filter(764, 502, &cfg(764, 502)), expected);
         // Odd configured sizes round down to the even encoder size.
-        assert_eq!(scale_filter(764, 502, &cfg(765, 503)), None);
+        assert_eq!(video_filter(764, 502, &cfg(765, 503)), expected);
     }
 
     #[test]
     fn scaled_output_preserves_aspect() {
-        let f = scale_filter(764, 502, &cfg(1920, 1080)).unwrap();
+        let f = video_filter(764, 502, &cfg(1920, 1080));
         assert!(f.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease"));
         assert!(f.contains("flags=lanczos"));
         assert!(f.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2"));
+        assert!(f.contains(BT709) && f.ends_with(BT709_TAGS));
+        assert!(!f.contains(char::is_whitespace), "{f}");
     }
 
     /// End-to-end check against a real FFmpeg: feed frames, confirm encoded
