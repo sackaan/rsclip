@@ -101,7 +101,7 @@ unsafe fn activate_process_loopback(target_pid: u32) -> Result<IAudioClient> {
         },
     };
 
-    let propvariant = create_blob_propvariant(&activation_params);
+    let propvariant = create_blob_propvariant(&activation_params)?;
 
     let done = Arc::new((StdMutex::new(false), Condvar::new()));
     let handler = ActivationHandler { done: done.clone() };
@@ -147,11 +147,12 @@ unsafe fn activate_process_loopback(target_pid: u32) -> Result<IAudioClient> {
 ///
 /// Safety: manually writes into the PROPVARIANT union. The blob data is
 /// allocated with `CoTaskMemAlloc` as required by the Windows API.
-unsafe fn create_blob_propvariant(params: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PROPVARIANT {
+unsafe fn create_blob_propvariant(params: &AUDIOCLIENT_ACTIVATION_PARAMS) -> Result<PROPVARIANT> {
     let params_size = std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>();
     let params_ptr = params as *const _ as *const u8;
 
     let alloc = CoTaskMemAlloc(params_size);
+    anyhow::ensure!(!alloc.is_null(), "CoTaskMemAlloc failed");
     std::ptr::copy_nonoverlapping(params_ptr, alloc as *mut u8, params_size);
 
     // PROPVARIANT layout: [u16 vt][u16 r1][u16 r2][u16 r3][union...]
@@ -177,7 +178,7 @@ unsafe fn create_blob_propvariant(params: &AUDIOCLIENT_ACTIVATION_PARAMS) -> PRO
         std::mem::size_of::<usize>(),
     );
 
-    pv
+    Ok(pv)
 }
 
 /// Run the WASAPI capture loop. Blocks until `running` is set to `false`.
@@ -452,16 +453,17 @@ pub(super) unsafe fn device_capture_loop(
         src_format.is_float
     );
 
-    audio_client
-        .Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_NOPERSIST,
-            CAPTURE_BUFFER_HNS,
-            0,
-            format_ptr,
-            None,
-        )
-        .context("Failed to initialize mic audio client")?;
+    let init = audio_client.Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_NOPERSIST,
+        CAPTURE_BUFFER_HNS,
+        0,
+        format_ptr,
+        None,
+    );
+    // GetMixFormat allocates with CoTaskMemAlloc; the caller owns it.
+    CoTaskMemFree(Some(format_ptr as *const _));
+    init.context("Failed to initialize mic audio client")?;
 
     let capture_client: IAudioCaptureClient = audio_client
         .GetService()
