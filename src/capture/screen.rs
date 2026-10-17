@@ -31,9 +31,9 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -313,12 +313,21 @@ fn process_frame(
         return Ok(());
     }
 
+    // Before the pool is recreated after a shrink, the surface is larger
+    // than the live content; never read past the content.
+    let src_w = width.min(content.Width.max(1) as u32);
+    let src_h = height.min(content.Height.max(1) as u32);
+    let region = resolve_region(crop, src_w, src_h);
+    let (rw, rh) = (region.width, region.height);
+
+    // Only the crop region (the game canvas) is copied and read back, not
+    // the whole window with its sidebar and title bar.
     let staging = match staging_cache {
-        Some((tex, w, h)) if *w == width && *h == height => tex.clone(),
+        Some((tex, w, h)) if *w == rw && *h == rh => tex.clone(),
         _ => {
             let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
+                Width: rw,
+                Height: rh,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: desc.Format,
@@ -331,13 +340,21 @@ fn process_frame(
             let mut new_staging: Option<ID3D11Texture2D> = None;
             unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut new_staging))? };
             let new_staging = new_staging.context("CreateTexture2D returned None")?;
-            *staging_cache = Some((new_staging.clone(), width, height));
+            *staging_cache = Some((new_staging.clone(), rw, rh));
             new_staging
         }
     };
 
+    let src_box = D3D11_BOX {
+        left: region.x,
+        top: region.y,
+        front: 0,
+        right: region.x + rw,
+        bottom: region.y + rh,
+        back: 1,
+    };
     unsafe {
-        context.CopyResource(&staging, &texture);
+        context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &texture, 0, Some(&src_box));
     }
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -347,11 +364,6 @@ fn process_frame(
             .context("Failed to map staging texture")?;
     }
 
-    // Before the pool is recreated after a shrink, the surface is larger
-    // than the live content; never read past the content.
-    let src_w = width.min(content.Width.max(1) as u32);
-    let src_h = height.min(content.Height.max(1) as u32);
-
     let out_len = out_w as usize * out_h as usize * BYTES_PER_PIXEL;
     let mut out = match recycle.and_then(|r| r.try_recv().ok()) {
         Some(v) if v.len() == out_len => v,
@@ -359,17 +371,22 @@ fn process_frame(
     };
 
     let row_pitch = mapped.RowPitch as usize;
-    // SAFETY: a successful Map of a `height`-row staging texture yields
-    // `RowPitch` bytes per row, the last row holding at least
-    // `width * 4` bytes. The slice is only used before `Unmap` below.
+    // SAFETY: a successful Map of an `rh`-row staging texture yields
+    // `RowPitch` bytes per row, the last row holding at least `rw * 4`
+    // bytes. The slice is only used before `Unmap` below.
     let src = unsafe {
         std::slice::from_raw_parts(
             mapped.pData as *const u8,
-            row_pitch * (height as usize - 1) + width as usize * BYTES_PER_PIXEL,
+            row_pitch * (rh as usize - 1) + rw as usize * BYTES_PER_PIXEL,
         )
     };
-    let region = resolve_region(crop, src_w, src_h);
-    blit_fit(src, row_pitch, region, &mut out, out_w, out_h);
+    let staged = CropRect {
+        x: 0,
+        y: 0,
+        width: rw,
+        height: rh,
+    };
+    blit_fit(src, row_pitch, staged, &mut out, out_w, out_h);
 
     unsafe {
         context.Unmap(&staging, 0);
