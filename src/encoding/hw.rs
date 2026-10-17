@@ -97,6 +97,8 @@ impl HwEncoder {
                     preset.as_str().into(),
                     "-crf".into(),
                     crf.to_string(),
+                    "-threads".into(),
+                    x264_threads().to_string(),
                 ],
             },
             RateControl::CBR => {
@@ -116,12 +118,25 @@ impl HwEncoder {
                             br,
                             "-bufsize".into(),
                             bufsize,
+                            "-threads".into(),
+                            x264_threads().to_string(),
                         ]
                     }
                 }
             }
         }
     }
+}
+
+/// libx264 worker threads. x264's default (1.5x logical cores, 48 on a
+/// 32-thread CPU) spends ~25-30% more CPU than 8 threads for the same
+/// output, CPU taken from the game, while 8 still encodes 1440p60 at
+/// veryfast ~2.8x faster than real time (measured).
+fn x264_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
 }
 
 impl std::fmt::Display for HwEncoder {
@@ -253,6 +268,9 @@ mod tests {
         assert!(args.contains(&"23".to_string()));
         assert!(args.contains(&"-preset".to_string()));
         assert!(args.contains(&"veryfast".to_string()));
+        let i = args.iter().position(|a| a == "-threads").unwrap();
+        let n: usize = args[i + 1].parse().unwrap();
+        assert!((1..=8).contains(&n));
     }
 
     #[test]
@@ -274,6 +292,7 @@ mod tests {
         // Should not contain software-specific args
         assert!(!args.contains(&"-preset".to_string()));
         assert!(!args.contains(&"-crf".to_string()));
+        assert!(!args.contains(&"-threads".to_string()));
     }
 
     #[test]
