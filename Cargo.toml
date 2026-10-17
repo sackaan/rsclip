@@ -64,8 +64,8 @@ parking_lot = "0.12"
 # Global hotkeys
 global-hotkey = "0.6"
 
-# Image handling
-image = "0.25"
+# Image handling (only the embedded PNG icon is decoded)
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Error handling
 anyhow = "1.0"
@@ -95,7 +95,7 @@ ron = "0.8"
 
 [build-dependencies]
 winresource = "0.1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 ico = "0.3"
 
 [profile.release]
