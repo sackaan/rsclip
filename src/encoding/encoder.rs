@@ -1,8 +1,9 @@
 //! Live encoding pipeline.
 //!
 //! A persistent FFmpeg subprocess encodes raw BGRA frames to H.264 MPEG-TS
-//! in real time. Saving a clip snapshots the encoded buffer and remuxes to
-//! MP4 (stream copy — no re-encode), with the mixed audio muxed in.
+//! in real time. Saving a clip snapshots the encoded buffer into a
+//! [`SaveRequest`] that is remuxed to MP4 (stream copy — no re-encode), with
+//! the mixed audio muxed in.
 
 use std::io::{Read, Write};
 use std::process::{Child, Stdio};
@@ -19,33 +20,39 @@ use crate::encoding::buffer::{EncodedReplayBuffer, SharedEncodedBuffer};
 use crate::encoding::config::EncoderConfig;
 
 use super::hw::ffmpeg_cmd;
-use super::remux::remux_to_mp4;
 use super::types::SaveRequest;
 
 pub use super::hw::{detect_best_encoder, is_ffmpeg_available, HwEncoder};
 pub use super::types::{build_preview_frame, RawFrame, SharedPreviewFrame};
 
+/// Spare frame buffers kept for reuse by the capture side.
+const RECYCLE_DEPTH: usize = 4;
+
 /// Manages a persistent FFmpeg process for real-time H.264 encoding.
 ///
-/// Three background threads: writer (feeds frames to stdin), reader (captures
-/// encoded TS from stdout), and save worker (remuxes TS to MP4 on demand).
+/// Three background threads: writer (feeds frames to stdin), reader
+/// (captures encoded TS from stdout), and a stderr logger. The encoded
+/// buffer outlives the FFmpeg process, so footage stays savable after
+/// [`stop`](LiveEncoder::stop) or an encoder crash.
 pub struct LiveEncoder {
     /// Send raw frames here for encoding.
     frame_tx: Sender<RawFrame>,
+    /// Frame buffers handed back by the writer for the capture to reuse.
+    recycle_rx: Receiver<Vec<u8>>,
     /// The encoded output buffer (shared with reader thread).
     encoded_buffer: SharedEncodedBuffer,
     /// Latest frame snapshot for UI preview.
     preview_frame: SharedPreviewFrame,
     /// Signal threads to stop.
     running: Arc<AtomicBool>,
-    /// Receive save results (polled by the app).
-    result_rx: Receiver<anyhow::Result<String>>,
-    /// Send save requests to the save worker.
-    save_tx: Sender<SaveRequest>,
+    /// Set when FFmpeg dies or its pipes break while still running.
+    failed: Arc<AtomicBool>,
     /// Audio bitrate for AAC encoding during remux.
     audio_bitrate_kbps: u32,
     /// Which encoder backend is active.
     hw_encoder: HwEncoder,
+    /// Frame size the encoder was started with (always even).
+    frame_size: (u32, u32),
 }
 
 impl LiveEncoder {
@@ -54,19 +61,27 @@ impl LiveEncoder {
     ///
     /// [`frame_sender`]: LiveEncoder::frame_sender
     pub fn start(cfg: EncoderConfig) -> anyhow::Result<Self> {
+        let enc_width = cfg.width & !1;
+        let enc_height = cfg.height & !1;
+        anyhow::ensure!(
+            enc_width > 0 && enc_height > 0,
+            "capture area too small ({}x{})",
+            cfg.width,
+            cfg.height
+        );
+
         let running = Arc::new(AtomicBool::new(true));
+        let failed = Arc::new(AtomicBool::new(false));
         let encoded_buffer: SharedEncodedBuffer =
             Arc::new(RwLock::new(EncodedReplayBuffer::new(cfg.buffer_seconds)));
         let preview_frame: SharedPreviewFrame = Arc::new(parking_lot::Mutex::new(None));
 
-        let enc_width = cfg.width & !1;
-        let enc_height = cfg.height & !1;
         let fps = cfg.fps;
         let audio_bitrate_kbps = cfg.audio_bitrate_kbps;
+        let frame_len = enc_width as usize * enc_height as usize * 4;
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<RawFrame>(2);
-        let (save_tx, save_rx) = crossbeam_channel::bounded::<SaveRequest>(2);
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<anyhow::Result<String>>(4);
+        let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(RECYCLE_DEPTH);
 
         let mut hw_encoder = detect_best_encoder();
         let mut child = match Self::start_ffmpeg(enc_width, enc_height, &cfg, &hw_encoder) {
@@ -108,27 +123,16 @@ impl LiveEncoder {
 
         // Writer thread: clock-disciplined pacing to maintain constant frame rate.
         let running_w = running.clone();
+        let failed_w = failed.clone();
         let preview_clone = preview_frame.clone();
         std::thread::Builder::new()
             .name("encoder-writer".into())
             .spawn(move || {
                 let mut stdin = stdin;
-                let row_bytes = (enc_width * 4) as usize;
                 let mut last_preview = Instant::now();
                 let mut last_frame_data: Option<Vec<u8>> = None;
                 let start_time = Instant::now();
                 let mut frames_written: u64 = 0;
-
-                let mut write_frame = |data: &[u8], src_stride: usize| -> bool {
-                    for y in 0..enc_height as usize {
-                        let offset = y * src_stride;
-                        let end = offset + row_bytes;
-                        if end > data.len() || stdin.write_all(&data[offset..end]).is_err() {
-                            return false;
-                        }
-                    }
-                    true
-                };
 
                 loop {
                     if !running_w.load(Ordering::Relaxed) {
@@ -155,31 +159,36 @@ impl LiveEncoder {
                         frame_rx.try_recv().ok()
                     };
 
-                    if let Some(raw_frame) = got_frame {
-                        let fw = raw_frame.width & !1;
-                        let fh = raw_frame.height & !1;
-                        if fw != enc_width || fh != enc_height {
-                            continue;
-                        }
-
-                        if last_preview.elapsed() >= Duration::from_millis(250) {
-                            last_preview = Instant::now();
-                            let pf = build_preview_frame(&raw_frame);
-                            *preview_clone.lock() = Some(pf);
-                        }
-
-                        let src_stride = (raw_frame.width * 4) as usize;
-                        if !write_frame(&raw_frame.data, src_stride) {
-                            warn!("FFmpeg stdin write failed — encoder may have crashed");
-                            break;
-                        }
-                        last_frame_data = Some(raw_frame.data);
-                    } else {
-                        if let Some(ref data) = last_frame_data {
-                            if !write_frame(data, row_bytes) {
-                                warn!("FFmpeg stdin write failed — encoder may have crashed");
-                                break;
+                    // Every frame — fresh or repeated — is a packed buffer of
+                    // exactly the encoder's size, written in one call.
+                    let data = match got_frame {
+                        Some(raw_frame) => {
+                            if raw_frame.width != enc_width
+                                || raw_frame.height != enc_height
+                                || raw_frame.data.len() != frame_len
+                            {
+                                continue;
                             }
+                            if last_preview.elapsed() >= Duration::from_millis(250) {
+                                last_preview = Instant::now();
+                                let pf = build_preview_frame(&raw_frame);
+                                *preview_clone.lock() = Some(pf);
+                            }
+                            if let Some(old) = last_frame_data.replace(raw_frame.data) {
+                                let _ = recycle_tx.try_send(old);
+                            }
+                            last_frame_data.as_deref()
+                        }
+                        None => last_frame_data.as_deref(),
+                    };
+
+                    if let Some(data) = data {
+                        if stdin.write_all(data).is_err() {
+                            if running_w.load(Ordering::Relaxed) {
+                                warn!("FFmpeg stdin write failed — encoder may have crashed");
+                                failed_w.store(true, Ordering::SeqCst);
+                            }
+                            break;
                         }
                     }
 
@@ -193,6 +202,7 @@ impl LiveEncoder {
             })?;
 
         let running_r = running.clone();
+        let failed_r = failed.clone();
         let buffer_clone = encoded_buffer.clone();
         std::thread::Builder::new()
             .name("encoder-reader".into())
@@ -206,9 +216,8 @@ impl LiveEncoder {
                     match stdout.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let _t = crate::metrics::Timer::start(
-                                crate::metrics::Stage::BufferPush,
-                            );
+                            let _t =
+                                crate::metrics::Timer::start(crate::metrics::Stage::BufferPush);
                             buffer_clone.write().push(buf[..n].to_vec());
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -218,17 +227,11 @@ impl LiveEncoder {
                         }
                     }
                 }
-                info!("Encoder reader thread stopped");
-            })?;
-
-        std::thread::Builder::new()
-            .name("save-worker".into())
-            .spawn(move || {
-                for request in save_rx.iter() {
-                    let result = remux_to_mp4(&request);
-                    let _ = result_tx.send(result);
+                if running_r.load(Ordering::Relaxed) {
+                    warn!("FFmpeg output ended unexpectedly");
+                    failed_r.store(true, Ordering::SeqCst);
                 }
-                info!("Save worker thread stopped");
+                info!("Encoder reader thread stopped");
             })?;
 
         info!(
@@ -238,13 +241,14 @@ impl LiveEncoder {
 
         Ok(Self {
             frame_tx,
+            recycle_rx,
             encoded_buffer,
             preview_frame,
             running,
-            result_rx,
-            save_tx,
+            failed,
             audio_bitrate_kbps,
             hw_encoder,
+            frame_size: (enc_width, enc_height),
         })
     }
 
@@ -276,17 +280,8 @@ impl LiveEncoder {
             cmd.arg(arg);
         }
 
-        // Only apply scaling if input and output dimensions differ.
-        if enc_width != cfg.output_width || enc_height != cfg.output_height {
-            cmd.args([
-                "-vf",
-                &format!(
-                    "scale={}:{}:flags={}",
-                    cfg.output_width,
-                    cfg.output_height,
-                    cfg.scale_filter.as_str()
-                ),
-            ]);
+        if let Some(filter) = scale_filter(enc_width, enc_height, cfg) {
+            cmd.args(["-vf", &filter]);
         }
 
         cmd.args(["-pix_fmt", encoder.pix_fmt()])
@@ -307,6 +302,16 @@ impl LiveEncoder {
         self.frame_tx.clone()
     }
 
+    /// Clone the channel of spent frame buffers the capture should reuse.
+    pub fn frame_recycler(&self) -> Receiver<Vec<u8>> {
+        self.recycle_rx.clone()
+    }
+
+    /// Frame size (always even) every submitted frame must have.
+    pub fn frame_size(&self) -> (u32, u32) {
+        self.frame_size
+    }
+
     /// Borrow the shared encoded ring buffer (read by the GUI for status,
     /// snapshotted on save).
     pub fn encoded_buffer(&self) -> &SharedEncodedBuffer {
@@ -323,36 +328,35 @@ impl LiveEncoder {
         self.hw_encoder
     }
 
-    /// Queue a clip save request. Returns `true` if accepted, `false` if
-    /// the encoded buffer is empty or the save worker queue is full.
-    pub fn save_clip(
+    /// Whether FFmpeg stopped on its own (crash, broken pipe) rather than
+    /// through [`stop`](LiveEncoder::stop).
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot the encoded buffer into a save request. Returns `None` if
+    /// nothing has been encoded yet.
+    pub(crate) fn save_request(
         &self,
         output_dir: &str,
         audio_wav: Option<Vec<u8>>,
         video_duration_secs: f64,
-    ) -> bool {
+    ) -> Option<SaveRequest> {
         let encoded_data = self.encoded_buffer.read().snapshot();
         if encoded_data.is_empty() {
-            return false;
+            return None;
         }
-        self.save_tx
-            .try_send(SaveRequest {
-                encoded_data,
-                output_dir: output_dir.to_string(),
-                audio_wav,
-                video_duration_secs,
-                audio_bitrate_kbps: self.audio_bitrate_kbps,
-            })
-            .is_ok()
+        Some(SaveRequest {
+            encoded_data,
+            output_dir: output_dir.to_string(),
+            audio_wav,
+            video_duration_secs,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
+        })
     }
 
-    /// Poll for a finished save result. Non-blocking. Drains one result per
-    /// call.
-    pub fn poll_result(&self) -> Option<anyhow::Result<String>> {
-        self.result_rx.try_recv().ok()
-    }
-
-    /// Signal all worker threads to wind down. Idempotent.
+    /// Signal all worker threads to wind down. Idempotent. The encoded
+    /// buffer is kept.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
@@ -361,5 +365,110 @@ impl LiveEncoder {
 impl Drop for LiveEncoder {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// FFmpeg `-vf` value for scaling the `in_w`×`in_h` input to the configured
+/// output size, or `None` when no scaling is needed. Scaling preserves the
+/// source aspect ratio and pads with black instead of stretching.
+fn scale_filter(in_w: u32, in_h: u32, cfg: &EncoderConfig) -> Option<String> {
+    let out_w = cfg.output_width & !1;
+    let out_h = cfg.output_height & !1;
+    if out_w == 0 || out_h == 0 || (out_w == in_w && out_h == in_h) {
+        return None;
+    }
+    Some(format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags={f},\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+        w = out_w,
+        h = out_h,
+        f = cfg.scale_filter.as_str()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::config::{RateControl, ScaleFilter, X264Preset};
+
+    fn cfg(out_w: u32, out_h: u32) -> EncoderConfig {
+        EncoderConfig {
+            width: 765,
+            height: 503,
+            fps: 60,
+            buffer_seconds: 30,
+            output_width: out_w,
+            output_height: out_h,
+            rate_control: RateControl::Quality,
+            crf: 23,
+            video_bitrate_kbps: 6000,
+            x264_preset: X264Preset::Veryfast,
+            audio_bitrate_kbps: 128,
+            scale_filter: ScaleFilter::Lanczos,
+        }
+    }
+
+    #[test]
+    fn native_output_has_no_scale_filter() {
+        assert_eq!(scale_filter(764, 502, &cfg(764, 502)), None);
+        // Odd configured sizes round down to the even encoder size.
+        assert_eq!(scale_filter(764, 502, &cfg(765, 503)), None);
+    }
+
+    #[test]
+    fn scaled_output_preserves_aspect() {
+        let f = scale_filter(764, 502, &cfg(1920, 1080)).unwrap();
+        assert!(f.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease"));
+        assert!(f.contains("flags=lanczos"));
+        assert!(f.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2"));
+    }
+
+    /// End-to-end check against a real FFmpeg: feed frames, confirm encoded
+    /// output lands in the ring and survives `stop`. Needs FFmpeg on PATH or
+    /// beside the test binary, so it is opt-in:
+    /// `cargo test -- --ignored live_encoder`.
+    #[test]
+    #[ignore]
+    fn live_encoder_buffers_and_keeps_output_after_stop() {
+        crate::logging::init_gui_logger(log::LevelFilter::Info);
+        let dump_log = || {
+            let mut gen = 0;
+            for e in crate::logging::gui_logger()
+                .and_then(|l| l.entries_if_changed(&mut gen))
+                .unwrap_or_default()
+            {
+                eprintln!("[{}] {}", e.level, e.message);
+            }
+        };
+        // Large enough for every hardware encoder's minimum frame size.
+        let mut c = cfg(320, 240);
+        c.width = 321; // odd, like the RuneLite fixed-mode canvas
+        c.height = 240;
+        let enc = LiveEncoder::start(c).expect("ffmpeg available");
+        assert_eq!(enc.frame_size(), (320, 240));
+        let tx = enc.frame_sender();
+        for i in 0..90u8 {
+            let _ = tx.try_send(RawFrame {
+                data: vec![i; 320 * 240 * 4],
+                width: 320,
+                height: 240,
+            });
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while enc.encoded_buffer().read().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if enc.has_failed() || enc.encoded_buffer().read().is_empty() {
+            dump_log();
+            panic!("encoder produced no output (failed: {})", enc.has_failed());
+        }
+        enc.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!enc.has_failed(), "a requested stop is not a failure");
+        let req = enc
+            .save_request("unused", None, 1.0)
+            .expect("buffered output");
+        assert_eq!(req.encoded_data[0], 0x47, "MPEG-TS sync byte");
     }
 }

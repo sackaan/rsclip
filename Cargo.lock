@@ -3365,6 +3365,7 @@ dependencies = [
  "open",
  "parking_lot",
  "rfd",
+ "ron",
  "serde",
  "windows",
  "windows-core",

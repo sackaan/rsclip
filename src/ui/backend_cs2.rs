@@ -206,7 +206,7 @@ impl ClipperApp {
             x264_preset: self.settings.x264_preset,
         };
 
-        let tx = self.cs2_result_tx.clone();
+        let tx = self.save_result_tx.clone();
         std::thread::Builder::new()
             .name("cs2-save".into())
             .spawn(move || {
@@ -218,20 +218,5 @@ impl ClipperApp {
         self.status = RecordingStatus::Saving;
         self.status_msg = StatusMessage::info("Rendering blur...");
         info!("CS2 clip render queued ({} frames)", snapshot.frame_count);
-    }
-
-    pub(super) fn poll_cs2_results(&mut self) {
-        while let Ok(result) = self.cs2_result_rx.try_recv() {
-            self.is_saving.store(false, Ordering::SeqCst);
-            self.status_msg = match result {
-                Ok(msg) => StatusMessage::success(msg),
-                Err(e) => StatusMessage::error(format!("Failed: {e}")),
-            };
-            self.status = if self.cs2_capture.is_some() {
-                RecordingStatus::Recording
-            } else {
-                RecordingStatus::Idle
-            };
-        }
     }
 }

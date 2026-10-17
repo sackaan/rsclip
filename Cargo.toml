@@ -87,6 +87,11 @@ rfd = "0.15"
 # Latency histograms (only pulled in by the `metrics` feature)
 hdrhistogram = { version = "7", default-features = false, optional = true }
 
+[dev-dependencies]
+# Same version eframe uses for settings persistence; lets tests load saved
+# settings exactly as the app does.
+ron = "0.8"
+
 [build-dependencies]
 winresource = "0.1"
 image = "0.25"

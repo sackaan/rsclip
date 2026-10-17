@@ -5,8 +5,10 @@ use eframe::egui;
 use log::{error, info, warn};
 
 use crate::capture::audio::AudioMixer;
+use crate::capture::screen::{self, CaptureConfig, CaptureHandle};
 use crate::capture::sessions;
 use crate::encoding::encoder::{self, LiveEncoder};
+use crate::encoding::remux::remux_to_mp4;
 use crate::platform::hotkeys;
 use crate::platform::runelite::{self, RuneLiteWindow};
 use crate::utils::{RecordingStatus, Severity, StatusMessage};
@@ -81,7 +83,10 @@ impl ClipperApp {
                 let canvas_tag = if win.canvas_found { " (canvas)" } else { "" };
                 let n = self.runelite_windows.len();
                 Some(if n > 1 {
-                    format!("{}x{}{}  ·  {} clients", win.width, win.height, canvas_tag, n)
+                    format!(
+                        "{}x{}{}  ·  {} clients",
+                        win.width, win.height, canvas_tag, n
+                    )
                 } else {
                     format!("{}x{}{}", win.width, win.height, canvas_tag)
                 })
@@ -138,13 +143,16 @@ impl ClipperApp {
             return;
         }
         self.update_active_dimensions();
+        self.update_capture_crop();
         self.handle_focus_switch_recording();
         self.handle_focus_switch_preview();
         self.update_idle_window_detection();
     }
 
-    /// Verify the active window (and its canvas) still exist.
-    /// Returns `false` if the window was lost and recording was stopped.
+    /// Verify the active window still exists. If only its game canvas went
+    /// away (RuneLite can recreate it), adopt the freshly scanned canvas
+    /// instead of stopping. Returns `false` if the window was lost and
+    /// recording was stopped; the buffered footage stays savable.
     fn check_active_window_alive(&mut self) -> bool {
         let win = match &self.active_window {
             Some(w) => w,
@@ -152,18 +160,34 @@ impl ClipperApp {
         };
         if !runelite::is_window_alive(win.hwnd) {
             warn!("Active RuneLite window lost");
+            let was_recording = self.capture_handle.is_some();
             self.active_window = None;
             self.stop_recording_internal();
-            self.status_msg = StatusMessage::warning("RuneLite window closed");
+            self.status_msg = if was_recording {
+                StatusMessage::warning("RuneLite closed — buffer kept, save still works")
+            } else {
+                StatusMessage::warning("RuneLite window closed")
+            };
             return false;
         }
         if let Some(canvas) = win.canvas_hwnd {
             if !runelite::is_window_alive(canvas) {
-                warn!("Game canvas child lost, re-scanning");
-                self.active_window = None;
-                self.stop_recording_internal();
-                self.status_msg = StatusMessage::warning("Game canvas lost");
-                return false;
+                let hwnd = win.hwnd;
+                let rescanned = self
+                    .runelite_windows
+                    .iter()
+                    .find(|w| w.hwnd == hwnd)
+                    .cloned();
+                info!(
+                    "Game canvas child lost, re-resolved: {}",
+                    rescanned.as_ref().is_some_and(|w| w.canvas_found)
+                );
+                if let Some(w) = rescanned {
+                    self.active_window = Some(w);
+                } else if let Some(ref mut active) = self.active_window {
+                    active.canvas_hwnd = None;
+                    active.canvas_found = false;
+                }
             }
         }
         true
@@ -182,6 +206,47 @@ impl ClipperApp {
                 active.height = h;
             }
         }
+    }
+
+    /// Push the current canvas position/size to running captures so a moved
+    /// or resized canvas (sidebar toggled, window resized) keeps being
+    /// cropped correctly.
+    fn update_capture_crop(&self) {
+        let Some(ref win) = self.active_window else {
+            return;
+        };
+        if self.capture_handle.is_none() && self.preview_capture.is_none() {
+            return;
+        }
+        let crop = win.canvas_crop_rect();
+        for handle in [&self.capture_handle, &self.preview_capture]
+            .into_iter()
+            .flatten()
+        {
+            handle.set_crop(crop);
+        }
+    }
+
+    /// Start a capture of `win` feeding `encoder`, at the encoder's fixed
+    /// frame size.
+    fn start_encoder_capture(
+        &self,
+        win: &RuneLiteWindow,
+        encoder: &LiveEncoder,
+    ) -> anyhow::Result<CaptureHandle> {
+        let (out_width, out_height) = encoder.frame_size();
+        screen::start_capture(
+            win.capture_hwnd(),
+            encoder.frame_sender(),
+            CaptureConfig {
+                out_width,
+                out_height,
+                crop: win.canvas_crop_rect(),
+                max_fps: self.settings.fps,
+            },
+            self.dropped_frames.clone(),
+            Some(encoder.frame_recycler()),
+        )
     }
 
     /// While recording, switch capture if a different RuneLite client gains focus.
@@ -257,47 +322,19 @@ impl ClipperApp {
     }
 
     /// Switch the capture to a different RuneLite window while keeping the
-    /// encoder alive if the dimensions are compatible.
+    /// encoder and its buffer alive. A client of a different size is scaled
+    /// to fit the existing encoder size.
     fn switch_capture(&mut self, new_win: RuneLiteWindow) {
         // Stop old capture (but keep encoder + audio buffer).
         if let Some(handle) = self.capture_handle.take() {
             handle.stop();
         }
 
-        // Check if we can reuse the existing encoder (same dimensions).
-        let can_reuse = self.live_encoder.as_ref().is_some_and(|_| {
-            let old = self.active_window.as_ref().unwrap();
-            old.width == new_win.width && old.height == new_win.height
-        });
-
-        if !can_reuse {
-            // Dimensions differ — full restart.
-            if let Some(ref enc) = self.live_encoder {
-                enc.stop();
-            }
-            self.live_encoder = None;
-
-            let encoder =
-                match LiveEncoder::start(self.encoder_config(new_win.width, new_win.height)) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        error!("Failed to restart encoder on switch: {}", e);
-                        self.status = RecordingStatus::Error;
-                        self.status_msg = StatusMessage::error(format!("Encoder error: {}", e));
-                        self.active_window = Some(new_win);
-                        return;
-                    }
-                };
-            self.live_encoder = Some(encoder);
-        }
-
-        let frame_tx = self.live_encoder.as_ref().unwrap().frame_sender();
-        match crate::capture::screen::start_capture(
-            new_win.capture_hwnd(),
-            frame_tx,
-            new_win.canvas_crop_rect(),
-            self.dropped_frames.clone(),
-        ) {
+        let result = match self.live_encoder.as_ref() {
+            Some(enc) => self.start_encoder_capture(&new_win, enc),
+            None => Err(anyhow::anyhow!("no encoder running")),
+        };
+        match result {
             Ok(handle) => {
                 self.capture_handle = Some(handle);
 
@@ -365,14 +402,7 @@ impl ClipperApp {
             }
         };
 
-        let frame_tx = encoder.frame_sender();
-
-        match crate::capture::screen::start_capture(
-            win.capture_hwnd(),
-            frame_tx,
-            win.canvas_crop_rect(),
-            self.dropped_frames.clone(),
-        ) {
+        match self.start_encoder_capture(&win, &encoder) {
             Ok(handle) => {
                 let mode = if win.canvas_found { "canvas" } else { "window" };
                 self.capture_handle = Some(handle);
@@ -421,6 +451,9 @@ impl ClipperApp {
         self.status_msg = StatusMessage::info("Stopped");
     }
 
+    /// Stop capture, audio, and the FFmpeg process. The encoded buffer and
+    /// the audio rings are kept so the footage can still be saved until the
+    /// next recording starts.
     fn stop_recording_internal(&mut self) {
         if let Some(handle) = self.capture_handle.take() {
             handle.stop();
@@ -428,15 +461,14 @@ impl ClipperApp {
         if let Some(ref mixer) = self.audio_mixer {
             mixer.stop();
         }
-        self.audio_mixer = None;
         if let Some(ref encoder) = self.live_encoder {
             encoder.stop();
         }
-        // Keep the encoder alive while a save is in flight so we can poll results.
-        if !self.is_saving.load(Ordering::SeqCst) {
-            self.live_encoder = None;
-        }
-        self.status = RecordingStatus::Idle;
+        self.status = if self.is_saving.load(Ordering::SeqCst) {
+            RecordingStatus::Saving
+        } else {
+            RecordingStatus::Idle
+        };
 
         // If preview is open, restart standalone preview capture.
         if self.show_preview {
@@ -444,12 +476,29 @@ impl ClipperApp {
         }
     }
 
+    /// Detect an FFmpeg crash while recording: stop capturing into a dead
+    /// encoder and tell the user, keeping what was already buffered.
+    pub(super) fn check_encoder_health(&mut self) {
+        if self.capture_handle.is_none() {
+            return;
+        }
+        if !self.live_encoder.as_ref().is_some_and(|e| e.has_failed()) {
+            return;
+        }
+        error!("Encoder stopped unexpectedly; recording halted");
+        self.stop_recording_internal();
+        self.status = RecordingStatus::Error;
+        self.status_msg = StatusMessage::error("Encoder stopped — buffer kept; press ▶ to restart");
+    }
+
     /// Pull the latest frame from encoder or standalone capture into the preview texture.
     pub(super) fn update_preview_texture(&mut self, ctx: &egui::Context) {
         if !self.show_preview {
             return;
         }
-        let maybe_frame = if let Some(ref enc) = self.live_encoder {
+        // A stopped encoder keeps its buffer but no longer produces preview
+        // frames; use the standalone preview capture then.
+        let maybe_frame = if let (Some(_), Some(enc)) = (&self.capture_handle, &self.live_encoder) {
             enc.preview_frame().lock().take()
         } else {
             self.preview_frame.lock().take()
@@ -501,11 +550,18 @@ impl ClipperApp {
             })
             .ok();
 
-        match crate::capture::screen::start_capture(
+        match screen::start_capture(
             win.capture_hwnd(),
             frame_tx,
-            win.canvas_crop_rect(),
+            CaptureConfig {
+                out_width: (win.width & !1).max(2),
+                out_height: (win.height & !1).max(2),
+                crop: win.canvas_crop_rect(),
+                // The preview refreshes ~4x per second; don't read back more.
+                max_fps: 4,
+            },
             self.dropped_frames.clone(),
+            None,
         ) {
             Ok(handle) => self.preview_capture = Some(handle),
             Err(e) => warn!("Preview capture failed: {}", e),
@@ -544,33 +600,40 @@ impl ClipperApp {
             .map(|m| m.snapshot_mixed_wav(video_secs))
             .filter(|w| !w.is_empty());
 
-        if encoder.save_clip(&self.settings.output_dir, audio_wav, video_secs) {
-            self.is_saving.store(true, Ordering::SeqCst);
-            self.status = RecordingStatus::Saving;
-            self.status_msg = StatusMessage::info("Saving...");
-        } else {
-            self.status_msg = StatusMessage::warning("Busy, retry");
+        let Some(request) = encoder.save_request(&self.settings.output_dir, audio_wav, video_secs)
+        else {
+            self.status_msg = StatusMessage::warning("Buffer empty");
+            return;
+        };
+
+        let tx = self.save_result_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("save-worker".into())
+            .spawn(move || {
+                let _ = tx.send(remux_to_mp4(&request));
+            });
+        if let Err(e) = spawned {
+            self.status_msg = StatusMessage::error(format!("Save failed: {}", e));
+            return;
         }
+        self.is_saving.store(true, Ordering::SeqCst);
+        self.status = RecordingStatus::Saving;
+        self.status_msg = StatusMessage::info("Saving...");
     }
 
-    pub(super) fn poll_encode_results(&mut self) {
-        if let Some(ref encoder) = self.live_encoder {
-            while let Some(result) = encoder.poll_result() {
-                self.is_saving.store(false, Ordering::SeqCst);
-                self.status_msg = match result {
-                    Ok(msg) => StatusMessage::success(msg),
-                    Err(e) => StatusMessage::error(format!("Failed: {}", e)),
-                };
-                self.status = if self.capture_handle.is_some() {
-                    RecordingStatus::Recording
-                } else {
-                    RecordingStatus::Idle
-                };
-            }
-        }
-        // If we were keeping the encoder alive for a save, drop it now.
-        if !self.is_saving.load(Ordering::SeqCst) && self.capture_handle.is_none() {
-            self.live_encoder = None;
+    /// Drain finished saves (either pipeline) and update the status line.
+    pub(super) fn poll_save_results(&mut self) {
+        while let Ok(result) = self.save_result_rx.try_recv() {
+            self.is_saving.store(false, Ordering::SeqCst);
+            self.status_msg = match result {
+                Ok(msg) => StatusMessage::success(msg),
+                Err(e) => StatusMessage::error(format!("Failed: {}", e)),
+            };
+            self.status = if self.is_recording() {
+                RecordingStatus::Recording
+            } else {
+                RecordingStatus::Idle
+            };
         }
     }
 

@@ -49,9 +49,11 @@ pub struct ClipperApp {
     pub(super) cs2_window: Option<Cs2Window>,
     pub(super) cs2_capture: Option<Cs2CaptureHandle>,
     pub(super) cs2_buffer: Option<SharedAuBuffer>,
-    /// Channel carrying CS2 blur-render results back from the save thread.
-    pub(super) cs2_result_tx: crossbeam_channel::Sender<anyhow::Result<String>>,
-    pub(super) cs2_result_rx: crossbeam_channel::Receiver<anyhow::Result<String>>,
+    /// Channel carrying save results back from background save threads
+    /// (both pipelines). Owned by the app, not an encoder, so a result is
+    /// never lost when the encoder is replaced mid-save.
+    pub(super) save_result_tx: crossbeam_channel::Sender<anyhow::Result<String>>,
+    pub(super) save_result_rx: crossbeam_channel::Receiver<anyhow::Result<String>>,
 
     pub(super) mic_devices: Vec<MicDevice>,
     /// Snapshot of currently active audio sessions, refreshed on demand for
@@ -124,9 +126,17 @@ impl ClipperApp {
         let ffmpeg_available = encoder::is_ffmpeg_available();
         if !ffmpeg_available {
             warn!("FFmpeg not found in PATH — encoding will fail");
+        } else {
+            // Warm the cached encoder probe so pressing record doesn't stall
+            // the UI for the ~2 s it takes.
+            let _ = std::thread::Builder::new()
+                .name("encoder-probe".into())
+                .spawn(|| {
+                    encoder::detect_best_encoder();
+                });
         }
 
-        let (cs2_result_tx, cs2_result_rx) = crossbeam_channel::unbounded();
+        let (save_result_tx, save_result_rx) = crossbeam_channel::unbounded();
 
         Self {
             settings,
@@ -142,8 +152,8 @@ impl ClipperApp {
             cs2_window: None,
             cs2_capture: None,
             cs2_buffer: None,
-            cs2_result_tx: cs2_result_tx.clone(),
-            cs2_result_rx,
+            save_result_tx,
+            save_result_rx,
             mic_devices: Vec::new(),
             app_audio_sessions: Vec::new(),
             app_picker_open: false,
@@ -196,13 +206,18 @@ impl ClipperApp {
     }
 
     pub(super) fn encoder_config(&self, width: u32, height: u32) -> EncoderConfig {
+        let (output_width, output_height) = if self.settings.native_resolution {
+            (width, height)
+        } else {
+            (self.settings.output_width, self.settings.output_height)
+        };
         EncoderConfig {
             width,
             height,
             fps: self.settings.fps,
             buffer_seconds: self.settings.buffer_seconds,
-            output_width: self.settings.output_width,
-            output_height: self.settings.output_height,
+            output_width,
+            output_height,
             rate_control: self.settings.rate_control,
             crf: self.settings.crf,
             video_bitrate_kbps: self.settings.video_bitrate_kbps,
@@ -224,8 +239,8 @@ impl eframe::App for ClipperApp {
             GameTarget::Cs2 => self.refresh_cs2_window(),
         }
         self.poll_hotkeys();
-        self.poll_encode_results();
-        self.poll_cs2_results();
+        self.poll_save_results();
+        self.check_encoder_health();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         // Live preview is only wired for the RuneLite pipeline; the CS2 GPU

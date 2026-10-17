@@ -49,6 +49,9 @@ pub struct Settings {
     pub output_width: u32,
     pub output_height: u32,
     pub custom_resolution: bool,
+    /// Encode at the captured size with no scaling. When false, output is
+    /// scaled to `output_width`×`output_height` with the aspect ratio kept.
+    pub native_resolution: bool,
     /// Save clip hotkey combo string, e.g. "F8" or "Ctrl+Shift+F8".
     pub hotkey_combo: String,
     pub hotkey_display: String,
@@ -104,6 +107,7 @@ impl Default for Settings {
             output_width: 1920,
             output_height: 1080,
             custom_resolution: false,
+            native_resolution: true,
             hotkey_combo: utils::DEFAULT_HOTKEY_NAME.to_string(),
             hotkey_display: utils::DEFAULT_HOTKEY_NAME.to_string(),
             record_hotkey_combo: String::new(),
@@ -127,5 +131,25 @@ impl Default for Settings {
             cs2_blur_pct: 50,
             cs2_bitrate_kbps: 50_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_output_is_native_resolution() {
+        assert!(Settings::default().native_resolution);
+    }
+
+    #[test]
+    fn settings_saved_before_native_flag_load_as_native() {
+        // Older saves have no `native_resolution` key; they must not keep
+        // the old forced 1920x1080 upscale.
+        let old = "(output_width: 1920, output_height: 1080)";
+        let s: Settings = ron::from_str(old).unwrap();
+        assert!(s.native_resolution);
+        assert_eq!(s.output_width, 1920);
     }
 }

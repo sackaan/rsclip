@@ -132,7 +132,16 @@ impl std::fmt::Display for HwEncoder {
 
 /// Probe NVENC / QSV / AMF in that order; return the first that succeeds,
 /// otherwise [`HwEncoder::Software`].
+///
+/// Probing spawns up to three FFmpeg processes (~2 s), so the result is
+/// computed once per process and cached. Concurrent callers block until the
+/// first probe finishes; call it early from a background thread to warm it.
 pub fn detect_best_encoder() -> HwEncoder {
+    static DETECTED: std::sync::OnceLock<HwEncoder> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(probe_best_encoder)
+}
+
+fn probe_best_encoder() -> HwEncoder {
     for enc in &[HwEncoder::Nvenc, HwEncoder::Qsv, HwEncoder::Amf] {
         if probe_encoder(enc.codec_name()) {
             info!("Hardware encoder available: {:?}", enc);

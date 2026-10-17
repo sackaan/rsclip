@@ -827,11 +827,31 @@ impl ClipperApp {
                     .size(12.0)
                     .color(theme::white()),
             );
-            ui.checkbox(
-                &mut self.settings.custom_resolution,
-                egui::RichText::new("custom").size(10.0),
-            );
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut self.settings.native_resolution,
+                    egui::RichText::new("native").size(10.0),
+                )
+                .on_hover_text("Record at the game's own size, no scaling");
+                if !self.settings.native_resolution {
+                    ui.checkbox(
+                        &mut self.settings.custom_resolution,
+                        egui::RichText::new("custom").size(10.0),
+                    );
+                }
+            });
             ui.end_row();
+
+            if self.settings.native_resolution {
+                ui.label("");
+                ui.colored_label(
+                    theme::dim(),
+                    egui::RichText::new("same as game canvas").size(10.0),
+                );
+                ui.end_row();
+                self.output_folder_row(ui);
+                return;
+            }
 
             ui.label("");
             if self.settings.custom_resolution {
@@ -933,35 +953,39 @@ impl ClipperApp {
             }
             ui.end_row();
 
-            // ---- folder ----
-            ui.label(
-                egui::RichText::new("folder")
+            self.output_folder_row(ui);
+        });
+    }
+
+    fn output_folder_row(&mut self, ui: &mut egui::Ui) {
+        // ---- folder ----
+        ui.label(
+            egui::RichText::new("folder")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        {
+            let display_path = abbreviate_path(&self.settings.output_dir, 30);
+            let btn = egui::Button::new(
+                egui::RichText::new(display_path)
                     .size(12.0)
                     .color(theme::white()),
-            );
+            )
+            .fill(theme::bg_widget());
+            if ui
+                .add(btn)
+                .on_hover_text(&self.settings.output_dir)
+                .clicked()
             {
-                let display_path = abbreviate_path(&self.settings.output_dir, 30);
-                let btn = egui::Button::new(
-                    egui::RichText::new(display_path)
-                        .size(12.0)
-                        .color(theme::white()),
-                )
-                .fill(theme::bg_widget());
-                if ui
-                    .add(btn)
-                    .on_hover_text(&self.settings.output_dir)
-                    .clicked()
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_directory(&self.settings.output_dir)
+                    .pick_folder()
                 {
-                    if let Some(folder) = rfd::FileDialog::new()
-                        .set_directory(&self.settings.output_dir)
-                        .pick_folder()
-                    {
-                        self.settings.output_dir = folder.to_string_lossy().into_owned();
-                    }
+                    self.settings.output_dir = folder.to_string_lossy().into_owned();
                 }
             }
-            ui.end_row();
-        });
+        }
+        ui.end_row();
     }
 
     fn section_hotkeys(&mut self, ui: &mut egui::Ui) {
