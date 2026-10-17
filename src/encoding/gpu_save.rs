@@ -101,8 +101,11 @@ pub fn save_cs2_clip(request: &Cs2SaveRequest) -> anyhow::Result<String> {
     let _export = crate::metrics::Timer::start(crate::metrics::Stage::Export);
     utils::ensure_clips_dir(&request.output_dir)?;
 
-    let filename = utils::clip_filename();
-    let output_path = Path::new(&request.output_dir).join(&filename);
+    let output_path = utils::unique_clip_path(Path::new(&request.output_dir));
+    let filename = output_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let stem = filename.trim_end_matches(".mp4");
     let demuxer = request.intermediate_codec.ffmpeg_demuxer();
     let temp_path = Path::new(&request.output_dir).join(format!("_temp_{}.{}", stem, demuxer));

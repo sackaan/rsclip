@@ -29,6 +29,22 @@ pub fn clip_filename() -> String {
     now.format("RSClip_%Y%m%d_%H%M%S.mp4").to_string()
 }
 
+/// Path for a new clip in `dir` that does not overwrite an existing file.
+/// Uses [`clip_filename`], adding `_2`, `_3`, … when two clips are saved
+/// within the same second.
+pub fn unique_clip_path(dir: &Path) -> PathBuf {
+    let name = clip_filename();
+    let first = dir.join(&name);
+    if !first.exists() {
+        return first;
+    }
+    let stem = name.trim_end_matches(".mp4");
+    (2..)
+        .map(|n| dir.join(format!("{}_{}.mp4", stem, n)))
+        .find(|p| !p.exists())
+        .expect("unbounded suffix search always finds a free name")
+}
+
 /// Ensure `base` exists as a directory, creating it (and parents) if not.
 pub fn ensure_clips_dir(base: &str) -> Result<PathBuf> {
     let path = Path::new(base);
@@ -171,6 +187,27 @@ mod tests {
     fn test_status_message_accepts_string() {
         let msg = StatusMessage::info(format!("Detected: {}x{}", 1920, 1080));
         assert_eq!(msg.text, "Detected: 1920x1080");
+    }
+
+    #[test]
+    fn test_unique_clip_path_never_overwrites() {
+        let tmp = std::env::temp_dir().join(format!("rsclip_unique_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Pre-create the plain name and the first suffix for every second
+        // the test might straddle, so the helper must skip past both.
+        let mut taken = Vec::new();
+        for _ in 0..2 {
+            let p = unique_clip_path(&tmp);
+            std::fs::write(&p, b"x").unwrap();
+            taken.push(p);
+        }
+        let next = unique_clip_path(&tmp);
+        assert!(!next.exists());
+        assert!(!taken.contains(&next));
+        assert_eq!(next.extension().unwrap(), "mp4");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
