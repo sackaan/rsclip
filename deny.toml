@@ -1,0 +1,16 @@
+# cargo-deny configuration (`cargo deny check advisories`, run in CI).
+
+[graph]
+# RSClip only builds for Windows; crates that are only compiled on other
+# targets (e.g. eframe's Linux accessibility stack) never ship.
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained, no fixed release exists. Pulled in by
+    # accesskit_windows via eframe 0.31; goes away with the eframe upgrade.
+    { id = "RUSTSEC-2024-0436", reason = "transitive via eframe 0.31; no fix available" },
+    # `ttf-parser` is unmaintained, no fixed release exists. Used by egui's
+    # font rendering for the bundled fonts only (no untrusted input).
+    { id = "RUSTSEC-2026-0192", reason = "transitive via eframe 0.31; parses bundled fonts only" },
+]
