@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use eframe::egui;
 
 use super::app::ClipperApp;
@@ -94,8 +92,8 @@ impl ClipperApp {
                 egui::Sense::hover(),
             );
             ui.painter().rect_filled(rect, 0.0, theme::bg_widget());
-            let msg = if self.active_window.is_none() {
-                "no RuneLite window"
+            let msg = if !self.game_window_found() {
+                "no game window"
             } else {
                 "waiting for frame..."
             };
@@ -146,32 +144,14 @@ impl ClipperApp {
     }
 
     fn draw_info(&self, ui: &mut egui::Ui) {
-        let n_clients = self.runelite_windows.len();
-        if let Some(ref win) = self.active_window {
-            let canvas_tag = if win.canvas_found { " (canvas)" } else { "" };
-            let client_info = if n_clients > 1 {
-                format!(
-                    "{}x{}{}  ·  {} clients",
-                    win.width, win.height, canvas_tag, n_clients
-                )
-            } else {
-                format!("{}x{}{}", win.width, win.height, canvas_tag)
-            };
-            ui.colored_label(theme::muted(), client_info);
+        if let Some(line) = self.detected_window_line() {
+            ui.colored_label(theme::muted(), line);
         } else {
             ui.colored_label(theme::dim(), "no client detected");
         }
 
-        if let Some(ref enc) = self.live_encoder {
-            let buf = enc.encoded_buffer().read();
-            let dur = buf.duration_secs();
-            let mins = dur as u32 / 60;
-            let secs = dur as u32 % 60;
-            let mb = buf.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-            ui.colored_label(
-                theme::muted(),
-                format!("{}:{:02} · {:.1} MB", mins, secs, mb),
-            );
+        if let Some(line) = self.buffer_stats_line() {
+            ui.colored_label(theme::muted(), line);
         } else {
             ui.colored_label(theme::dim(), "0:00 · 0.0 MB");
         }
@@ -180,17 +160,11 @@ impl ClipperApp {
     fn draw_info_inline(&self, ui: &mut egui::Ui) {
         let mut parts: Vec<String> = Vec::new();
 
-        if let Some(ref win) = self.active_window {
-            let tag = if win.canvas_found { " (canvas)" } else { "" };
-            parts.push(format!("{}x{}{}", win.width, win.height, tag));
+        if let Some(line) = self.detected_window_line() {
+            parts.push(line);
         }
-        if let Some(ref enc) = self.live_encoder {
-            let buf = enc.encoded_buffer().read();
-            let dur = buf.duration_secs();
-            let mins = dur as u32 / 60;
-            let secs = dur as u32 % 60;
-            let mb = buf.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
-            parts.push(format!("{}:{:02} · {:.1} MB", mins, secs, mb));
+        if let Some(line) = self.buffer_stats_line() {
+            parts.push(line);
         }
         if parts.is_empty() {
             ui.colored_label(
@@ -206,18 +180,14 @@ impl ClipperApp {
     }
 
     fn render_action_buttons(&self, ui: &mut egui::Ui, btn_size: f32) -> ButtonAction {
-        let is_recording = self.capture_handle.is_some();
-        let rl_found = self.active_window.is_some();
-        let can_save = self
-            .live_encoder
-            .as_ref()
-            .is_some_and(|e| !e.encoded_buffer().read().is_empty())
-            && !self.is_saving.load(Ordering::SeqCst);
+        let is_recording = self.is_recording();
+        let game_found = self.game_window_found();
+        let can_save = self.can_save();
 
         let mut action = ButtonAction::None;
 
         if !is_recording {
-            let enabled = rl_found && self.ffmpeg_available;
+            let enabled = game_found && self.ffmpeg_available;
             let btn = egui::Button::new(egui::RichText::new("\u{25b6}").size(btn_size).color(
                 if enabled {
                     theme::white()

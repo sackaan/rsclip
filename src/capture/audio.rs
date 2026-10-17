@@ -263,12 +263,22 @@ fn new_canonical_buffer(buffer_seconds: u32) -> SharedAudioBuffer {
 }
 
 /// The kind of audio source backing a channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelKind {
-    /// Game audio captured via WASAPI process loopback.
+    /// Game audio captured via WASAPI process loopback (auto-follows RuneLite).
     Game,
     /// Microphone input captured via WASAPI device capture.
     Microphone,
+    /// Arbitrary user-picked application captured via WASAPI process loopback.
+    Application {
+        /// PID at the time the channel was created. May refer to a dead
+        /// process if the app exits mid-recording — the capture loop just
+        /// stops producing samples in that case.
+        pid: u32,
+        /// Lowercased exe basename, used as the stable identity across
+        /// process restarts (see [`Settings::app_channels`]).
+        exe_name: String,
+    },
 }
 
 /// A single audio source with its own background capture thread and ring
@@ -292,6 +302,23 @@ impl AudioChannel {
 
         Ok(Self {
             kind: ChannelKind::Game,
+            volume: 1.0,
+            running,
+            buffer,
+            thread: Some(thread),
+        })
+    }
+
+    fn start_application(buffer_seconds: u32, pid: u32, exe_name: String) -> Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = new_canonical_buffer(buffer_seconds);
+
+        // Application channels reuse the per-process loopback thread that
+        // the game channel uses — only difference is the PID source.
+        let thread = spawn_game_thread(&running, &buffer, pid)?;
+
+        Ok(Self {
+            kind: ChannelKind::Application { pid, exe_name },
             volume: 1.0,
             running,
             buffer,
@@ -427,6 +454,40 @@ impl AudioMixer {
     pub fn remove_mic_channel(&mut self) {
         self.channels
             .retain(|ch| ch.kind != ChannelKind::Microphone);
+    }
+
+    /// Start capturing audio from an arbitrary application via WASAPI
+    /// process loopback. `exe_name` is the lowercased exe basename used as
+    /// the stable identity (e.g. for persistence and removal).
+    pub fn add_application_channel(&mut self, pid: u32, exe_name: String) -> Result<()> {
+        let ch = AudioChannel::start_application(self.buffer_seconds, pid, exe_name)?;
+        self.channels.push(ch);
+        Ok(())
+    }
+
+    /// Remove the application channel matching `pid`, stopping its thread.
+    pub fn remove_application_channel(&mut self, pid: u32) {
+        self.channels.retain(|ch| match &ch.kind {
+            ChannelKind::Application { pid: p, .. } => *p != pid,
+            _ => true,
+        });
+    }
+
+    /// Find the live PID of the application channel whose exe matches
+    /// `exe_name`. Returns `None` when no such channel is attached.
+    pub fn application_pid_for_exe(&self, exe_name: &str) -> Option<u32> {
+        self.channels.iter().find_map(|ch| match &ch.kind {
+            ChannelKind::Application { pid, exe_name: e } if e == exe_name => Some(*pid),
+            _ => None,
+        })
+    }
+
+    /// Borrow an application channel mutably for volume / state tweaks.
+    pub fn application_channel_mut(&mut self, pid: u32) -> Option<&mut AudioChannel> {
+        self.channels.iter_mut().find(|ch| match &ch.kind {
+            ChannelKind::Application { pid: p, .. } => *p == pid,
+            _ => false,
+        })
     }
 
     /// Repoint the game-audio channel at a new process. Creates the channel

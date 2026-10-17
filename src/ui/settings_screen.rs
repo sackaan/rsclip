@@ -5,6 +5,8 @@ use log::warn;
 use super::app::ClipperApp;
 use super::theme;
 use crate::capture::audio;
+use crate::capture::sessions;
+use super::settings::{AppChannelConfig, GameTarget};
 use crate::encoding::config::{RateControl, ScaleFilter, X264Preset};
 use crate::platform::hotkeys;
 
@@ -163,6 +165,7 @@ impl ClipperApp {
                 ui.spacing_mut().interact_size.y = 16.0;
                 ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
 
+                self.section_game(ui);
                 self.section_general(ui);
                 self.section_audio(ui);
                 self.section_encoding(ui);
@@ -332,6 +335,9 @@ impl ClipperApp {
                 ui.end_row();
             }
 
+            // ---- application audio sources ----
+            self.draw_app_audio_rows(ui);
+
             // ---- audio bitrate ----
             ui.label(
                 egui::RichText::new("audio bitrate")
@@ -359,6 +365,320 @@ impl ClipperApp {
             }
             ui.end_row();
         });
+    }
+
+    /// Renders the list of configured application audio channels plus the
+    /// "+ add application" picker. Called from inside the Audio grid, so it
+    /// must close every row with `ui.end_row()`.
+    fn draw_app_audio_rows(&mut self, ui: &mut egui::Ui) {
+        // Header row: title in label cell, "add" button in control cell.
+        ui.label(
+            egui::RichText::new("application audio")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        ui.horizontal(|ui| {
+            let btn_label = if self.app_picker_open {
+                "cancel"
+            } else {
+                "+ add application"
+            };
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(btn_label).size(10.0))
+                        .fill(theme::bg_widget()),
+                )
+                .clicked()
+            {
+                self.app_picker_open = !self.app_picker_open;
+                if self.app_picker_open {
+                    self.refresh_app_audio_sessions();
+                }
+            }
+        });
+        ui.end_row();
+
+        // Picker row (only when open).
+        if self.app_picker_open {
+            ui.label("");
+            ui.horizontal(|ui| {
+                let already: std::collections::HashSet<String> = self
+                    .settings
+                    .app_channels
+                    .iter()
+                    .map(|c| c.exe_name.clone())
+                    .collect();
+
+                let selectable: Vec<_> = self
+                    .app_audio_sessions
+                    .iter()
+                    .filter(|s| !already.contains(&s.exe_name))
+                    .cloned()
+                    .collect();
+
+                let selected_label = if selectable.is_empty() {
+                    "no apps producing sound"
+                } else {
+                    "pick application\u{2026}"
+                };
+                let mut picked: Option<sessions::AudioSession> = None;
+                egui::ComboBox::from_id_salt("app_audio_picker")
+                    .selected_text(egui::RichText::new(selected_label).size(10.0))
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.spacing_mut().interact_size.y = 14.0;
+                        for sess in &selectable {
+                            let label = format!("{} (PID {})", sess.display_name, sess.pid);
+                            if ui
+                                .selectable_label(false, egui::RichText::new(&label).size(10.0))
+                                .clicked()
+                            {
+                                picked = Some(sess.clone());
+                            }
+                        }
+                    });
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("\u{21bb}").size(10.0))
+                            .fill(theme::bg_widget()),
+                    )
+                    .on_hover_text("refresh")
+                    .clicked()
+                {
+                    self.refresh_app_audio_sessions();
+                }
+                if let Some(sess) = picked {
+                    self.add_app_channel_from_session(sess);
+                    self.app_picker_open = false;
+                }
+            });
+            ui.end_row();
+        }
+
+        // One row per configured channel. Collect removals to apply after the loop.
+        let mut to_remove: Option<String> = None;
+        let mut volume_changes: Vec<(String, f32)> = Vec::new();
+
+        for cfg in &mut self.settings.app_channels {
+            ui.label(
+                egui::RichText::new(&cfg.display_name)
+                    .size(11.0)
+                    .color(theme::white()),
+            );
+            ui.horizontal(|ui| {
+                let mut vol = cfg.volume;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut vol, 0.0..=1.0)
+                            .text("")
+                            .custom_formatter(|v, _| format!("{}%", (v * 100.0) as u32))
+                            .clamping(egui::SliderClamping::Always),
+                    )
+                    .changed()
+                {
+                    cfg.volume = vol;
+                    volume_changes.push((cfg.exe_name.clone(), vol));
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("\u{00d7}")
+                                .size(11.0)
+                                .color(theme::white()),
+                        )
+                        .fill(theme::bg_widget()),
+                    )
+                    .on_hover_text("remove")
+                    .clicked()
+                {
+                    to_remove = Some(cfg.exe_name.clone());
+                }
+            });
+            ui.end_row();
+        }
+
+        // Apply live-mixer updates after the borrow loop.
+        for (exe, vol) in volume_changes {
+            if let Some(ref mut mixer) = self.audio_mixer {
+                if let Some(pid) = mixer.application_pid_for_exe(&exe) {
+                    if let Some(ch) = mixer.application_channel_mut(pid) {
+                        ch.volume = vol;
+                    }
+                }
+            }
+        }
+        if let Some(exe) = to_remove {
+            if let Some(ref mut mixer) = self.audio_mixer {
+                if let Some(pid) = mixer.application_pid_for_exe(&exe) {
+                    mixer.remove_application_channel(pid);
+                }
+            }
+            self.settings.app_channels.retain(|c| c.exe_name != exe);
+        }
+    }
+
+    fn refresh_app_audio_sessions(&mut self) {
+        let game_pid = match self.settings.game_target {
+            GameTarget::RuneLite => self.active_window.as_ref().map(|w| w.pid),
+            GameTarget::Cs2 => self.cs2_window.as_ref().map(|w| w.pid),
+        }
+        .unwrap_or(0);
+        match sessions::enumerate_audio_sessions(&[game_pid]) {
+            Ok(s) => self.app_audio_sessions = s,
+            Err(e) => warn!("Audio session enumeration failed: {}", e),
+        }
+    }
+
+    fn add_app_channel_from_session(&mut self, sess: sessions::AudioSession) {
+        self.settings.app_channels.push(AppChannelConfig {
+            exe_name: sess.exe_name.clone(),
+            display_name: sess.display_name.clone(),
+            volume: 1.0,
+        });
+        if let Some(ref mut mixer) = self.audio_mixer {
+            if let Err(e) = mixer.add_application_channel(sess.pid, sess.exe_name.clone()) {
+                warn!("Failed to start app channel {}: {}", sess.display_name, e);
+            }
+        }
+    }
+
+    fn section_game(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Game", true, |ui| {
+            // ---- target game (selects the capture pipeline) ----
+            ui.label(
+                egui::RichText::new("target")
+                    .size(12.0)
+                    .color(theme::white()),
+            );
+            let prev = self.settings.game_target;
+            ui.horizontal(|ui| {
+                for target in [GameTarget::RuneLite, GameTarget::Cs2] {
+                    ui.selectable_value(
+                        &mut self.settings.game_target,
+                        target,
+                        egui::RichText::new(target.label()).size(10.0),
+                    );
+                }
+            });
+            ui.end_row();
+
+            if self.settings.game_target != prev {
+                // Switching pipelines: stop whatever was running on the old one.
+                self.stop_any_recording();
+            }
+
+            if self.settings.game_target == GameTarget::Cs2 {
+                self.cs2_settings_rows(ui);
+            }
+        });
+    }
+
+    /// CS2-only controls (capture fps, blur, intermediate bitrate). Called
+    /// inside the Game grid, so every row ends with `ui.end_row()`.
+    fn cs2_settings_rows(&mut self, ui: &mut egui::Ui) {
+        // ---- capture fps (capped at monitor refresh by WGC) ----
+        ui.label(
+            egui::RichText::new("capture fps")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        ui.horizontal(|ui| {
+            let mut fps = self.settings.cs2_capture_fps;
+            if ui
+                .add(egui::DragValue::new(&mut fps).range(60..=360).speed(1))
+                .changed()
+            {
+                self.settings.cs2_capture_fps = fps;
+            }
+            ui.colored_label(
+                theme::dim(),
+                egui::RichText::new("≤ monitor Hz").size(9.0),
+            );
+        });
+        ui.end_row();
+
+        // ---- output fps ----
+        ui.label(
+            egui::RichText::new("output fps")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        let mut out_fps = self.settings.cs2_output_fps;
+        if ui
+            .add(egui::DragValue::new(&mut out_fps).range(24..=120).speed(1))
+            .changed()
+        {
+            self.settings.cs2_output_fps = out_fps;
+        }
+        ui.end_row();
+
+        // ---- motion blur toggle ----
+        ui.label(
+            egui::RichText::new("motion blur")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        ui.checkbox(
+            &mut self.settings.cs2_blur_enabled,
+            egui::RichText::new("blend real frames").size(10.0),
+        );
+        ui.end_row();
+
+        // ---- blur strength (shutter) ----
+        if self.settings.cs2_blur_enabled {
+            ui.label(
+                egui::RichText::new("blur strength")
+                    .size(12.0)
+                    .color(theme::white()),
+            );
+            ui.horizontal(|ui| {
+                let mut pct = self.settings.cs2_blur_pct;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut pct, 0..=100)
+                            .text("")
+                            .custom_formatter(|v, _| format!("{}%", v as u32))
+                            .clamping(egui::SliderClamping::Always),
+                    )
+                    .changed()
+                {
+                    self.settings.cs2_blur_pct = pct;
+                }
+                ui.colored_label(
+                    theme::dim(),
+                    egui::RichText::new(if pct >= 100 {
+                        "360° shutter"
+                    } else if pct >= 50 {
+                        "cinematic"
+                    } else {
+                        "subtle"
+                    })
+                    .size(9.0),
+                );
+            });
+            ui.end_row();
+        }
+
+        // ---- capture (intermediate) bitrate ----
+        ui.label(
+            egui::RichText::new("capture bitrate")
+                .size(12.0)
+                .color(theme::white()),
+        );
+        let mut br = self.settings.cs2_bitrate_kbps;
+        if ui
+            .add(
+                egui::DragValue::new(&mut br)
+                    .range(5_000..=150_000)
+                    .speed(500)
+                    .suffix(" kbps"),
+            )
+            .changed()
+        {
+            self.settings.cs2_bitrate_kbps = br;
+        }
+        ui.end_row();
     }
 
     fn section_general(&mut self, ui: &mut egui::Ui) {

@@ -206,6 +206,9 @@ impl LiveEncoder {
                     match stdout.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let _t = crate::metrics::Timer::start(
+                                crate::metrics::Stage::BufferPush,
+                            );
                             buffer_clone.write().push(buf[..n].to_vec());
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

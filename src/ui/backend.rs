@@ -5,14 +5,125 @@ use eframe::egui;
 use log::{error, info, warn};
 
 use crate::capture::audio::AudioMixer;
+use crate::capture::sessions;
 use crate::encoding::encoder::{self, LiveEncoder};
 use crate::platform::hotkeys;
 use crate::platform::runelite::{self, RuneLiteWindow};
 use crate::utils::{RecordingStatus, Severity, StatusMessage};
 
 use super::app::ClipperApp;
+use super::settings::GameTarget;
 
 impl ClipperApp {
+    /// Whether a capture session is currently running, for the active target.
+    pub(super) fn is_recording(&self) -> bool {
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.capture_handle.is_some(),
+            GameTarget::Cs2 => self.cs2_capture.is_some(),
+        }
+    }
+
+    /// Whether the target game's window has been detected.
+    pub(super) fn game_window_found(&self) -> bool {
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.active_window.is_some(),
+            GameTarget::Cs2 => self.cs2_window.is_some(),
+        }
+    }
+
+    /// Whether there is buffered footage that can be saved right now.
+    pub(super) fn can_save(&self) -> bool {
+        if self.is_saving.load(Ordering::SeqCst) {
+            return false;
+        }
+        match self.settings.game_target {
+            GameTarget::RuneLite => self
+                .live_encoder
+                .as_ref()
+                .is_some_and(|e| !e.encoded_buffer().read().is_empty()),
+            GameTarget::Cs2 => self
+                .cs2_buffer
+                .as_ref()
+                .is_some_and(|b| !b.lock().is_empty()),
+        }
+    }
+
+    /// Start recording on whichever pipeline matches the active target.
+    pub(super) fn start_recording(&mut self) {
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.start_recording_runelite(),
+            GameTarget::Cs2 => self.start_recording_cs2(),
+        }
+    }
+
+    /// Stop recording on whichever pipeline is active.
+    pub(super) fn stop_recording(&mut self) {
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.stop_recording_runelite(),
+            GameTarget::Cs2 => self.stop_recording_cs2(),
+        }
+    }
+
+    /// Save a clip from whichever pipeline is active.
+    pub(super) fn save_clip(&mut self) {
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.save_clip_runelite(),
+            GameTarget::Cs2 => self.save_clip_cs2(),
+        }
+    }
+
+    /// One-line description of the detected game window for the main screen,
+    /// or `None` if nothing is detected for the active target.
+    pub(super) fn detected_window_line(&self) -> Option<String> {
+        match self.settings.game_target {
+            GameTarget::RuneLite => {
+                let win = self.active_window.as_ref()?;
+                let canvas_tag = if win.canvas_found { " (canvas)" } else { "" };
+                let n = self.runelite_windows.len();
+                Some(if n > 1 {
+                    format!("{}x{}{}  ·  {} clients", win.width, win.height, canvas_tag, n)
+                } else {
+                    format!("{}x{}{}", win.width, win.height, canvas_tag)
+                })
+            }
+            GameTarget::Cs2 => {
+                let win = self.cs2_window.as_ref()?;
+                Some(format!("{}x{} (CS2)", win.width, win.height))
+            }
+        }
+    }
+
+    /// One-line buffer duration + memory readout for the active target, or
+    /// `None` when no buffer is live.
+    pub(super) fn buffer_stats_line(&self) -> Option<String> {
+        let (dur, bytes) = match self.settings.game_target {
+            GameTarget::RuneLite => {
+                let enc = self.live_encoder.as_ref()?;
+                let buf = enc.encoded_buffer().read();
+                (buf.duration_secs(), buf.memory_usage_bytes())
+            }
+            GameTarget::Cs2 => {
+                let buf = self.cs2_buffer.as_ref()?.lock();
+                (buf.duration_secs(), buf.memory_usage_bytes())
+            }
+        };
+        let mins = dur as u32 / 60;
+        let secs = dur as u32 % 60;
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        Some(format!("{}:{:02} · {:.1} MB", mins, secs, mb))
+    }
+
+    /// Stop any in-progress recording on either pipeline. Used when the user
+    /// switches the target game so the old pipeline doesn't keep running.
+    pub(super) fn stop_any_recording(&mut self) {
+        if self.capture_handle.is_some() {
+            self.stop_recording_runelite();
+        }
+        if self.cs2_capture.is_some() {
+            self.stop_recording_cs2();
+        }
+    }
+
     /// Periodic poll: rescan RuneLite windows, validate the active window,
     /// and handle focus-based capture switching.
     pub(super) fn refresh_runelite_window(&mut self) {
@@ -221,7 +332,7 @@ impl ClipperApp {
         self.active_window = Some(new_win);
     }
 
-    pub(super) fn start_recording(&mut self) {
+    fn start_recording_runelite(&mut self) {
         if self.capture_handle.is_some() {
             return;
         }
@@ -287,6 +398,7 @@ impl ClipperApp {
                         Err(e) => warn!("No mic audio: {}", e),
                     }
                 }
+                attach_configured_app_channels(&mut mixer, &self.settings.app_channels, win.pid);
                 self.audio_mixer = Some(mixer);
 
                 self.status = RecordingStatus::Recording;
@@ -304,7 +416,7 @@ impl ClipperApp {
         }
     }
 
-    pub(super) fn stop_recording(&mut self) {
+    fn stop_recording_runelite(&mut self) {
         self.stop_recording_internal();
         self.status_msg = StatusMessage::info("Stopped");
     }
@@ -407,7 +519,7 @@ impl ClipperApp {
         }
     }
 
-    pub(super) fn save_clip(&mut self) {
+    fn save_clip_runelite(&mut self) {
         if self.is_saving.load(Ordering::SeqCst) {
             self.status_msg = StatusMessage::warning("Already saving...");
             return;
@@ -475,7 +587,7 @@ impl ClipperApp {
                 info!("Hotkey: Save Clip");
                 self.save_clip();
             } else if record_id == Some(event.id()) {
-                if self.capture_handle.is_some() {
+                if self.is_recording() {
                     info!("Hotkey: Stop Recording");
                     self.stop_recording();
                 } else {
@@ -483,6 +595,49 @@ impl ClipperApp {
                     self.start_recording();
                 }
             }
+        }
+    }
+}
+
+/// Re-resolve each persisted `AppChannelConfig` to a live PID and attach it
+/// to the mixer. Apps that are not currently producing audio (no WASAPI
+/// session) or were filtered out (system sounds, the game PID, our own PID)
+/// are skipped silently — they will pick up audio on their next recording
+/// session if they're running by then.
+pub(super) fn attach_configured_app_channels(
+    mixer: &mut AudioMixer,
+    configs: &[super::settings::AppChannelConfig],
+    game_pid: u32,
+) {
+    if configs.is_empty() {
+        return;
+    }
+
+    let sessions = match sessions::enumerate_audio_sessions(&[game_pid]) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Could not enumerate audio sessions: {}", e);
+            return;
+        }
+    };
+
+    for cfg in configs {
+        let exe = cfg.exe_name.to_lowercase();
+        let Some(session) = sessions.iter().find(|s| s.exe_name == exe) else {
+            info!("App audio source '{}' not running — skipping", cfg.exe_name);
+            continue;
+        };
+        match mixer.add_application_channel(session.pid, session.exe_name.clone()) {
+            Ok(()) => {
+                if let Some(ch) = mixer.application_channel_mut(session.pid) {
+                    ch.volume = cfg.volume;
+                }
+                info!(
+                    "App audio capture started for {} (PID {})",
+                    cfg.display_name, session.pid
+                );
+            }
+            Err(e) => warn!("Failed to capture {}: {}", cfg.display_name, e),
         }
     }
 }

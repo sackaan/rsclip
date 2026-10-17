@@ -6,14 +6,18 @@ use eframe::egui;
 use log::{error, info, warn};
 
 use crate::capture::audio::{AudioMixer, MicDevice};
+use crate::capture::cs2_capture::Cs2CaptureHandle;
+use crate::capture::sessions::AudioSession;
 use crate::capture::screen::CaptureHandle;
 use crate::encoding::config::EncoderConfig;
 use crate::encoding::encoder::{self, LiveEncoder, SharedPreviewFrame};
+use crate::encoding::gpu_buffer::SharedAuBuffer;
+use crate::platform::cs2::Cs2Window;
 use crate::platform::hotkeys::HotkeyManager;
 use crate::platform::runelite::RuneLiteWindow;
 use crate::utils::{RecordingStatus, StatusMessage};
 
-use super::settings::{Settings, SETTINGS_KEY};
+use super::settings::{GameTarget, Settings, SETTINGS_KEY};
 use super::theme;
 
 const RS_FONT_FAMILY: &str = "RuneScape";
@@ -41,7 +45,20 @@ pub struct ClipperApp {
     pub(super) live_encoder: Option<LiveEncoder>,
     pub(super) audio_mixer: Option<AudioMixer>,
 
+    // --- CS2 GPU capture path (parallel to the RuneLite path above) ---
+    pub(super) cs2_window: Option<Cs2Window>,
+    pub(super) cs2_capture: Option<Cs2CaptureHandle>,
+    pub(super) cs2_buffer: Option<SharedAuBuffer>,
+    /// Channel carrying CS2 blur-render results back from the save thread.
+    pub(super) cs2_result_tx: crossbeam_channel::Sender<anyhow::Result<String>>,
+    pub(super) cs2_result_rx: crossbeam_channel::Receiver<anyhow::Result<String>>,
+
     pub(super) mic_devices: Vec<MicDevice>,
+    /// Snapshot of currently active audio sessions, refreshed on demand for
+    /// the "add application" picker.
+    pub(super) app_audio_sessions: Vec<AudioSession>,
+    /// Whether the "add application" picker is currently expanded.
+    pub(super) app_picker_open: bool,
 
     pub(super) hotkey_manager: Option<HotkeyManager>,
 
@@ -109,6 +126,8 @@ impl ClipperApp {
             warn!("FFmpeg not found in PATH — encoding will fail");
         }
 
+        let (cs2_result_tx, cs2_result_rx) = crossbeam_channel::unbounded();
+
         Self {
             settings,
 
@@ -120,7 +139,14 @@ impl ClipperApp {
             capture_handle: None,
             live_encoder: None,
             audio_mixer: None,
+            cs2_window: None,
+            cs2_capture: None,
+            cs2_buffer: None,
+            cs2_result_tx: cs2_result_tx.clone(),
+            cs2_result_rx,
             mic_devices: Vec::new(),
+            app_audio_sessions: Vec::new(),
+            app_picker_open: false,
 
             hotkey_manager,
 
@@ -193,12 +219,18 @@ impl eframe::App for ClipperApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.refresh_runelite_window();
+        match self.settings.game_target {
+            GameTarget::RuneLite => self.refresh_runelite_window(),
+            GameTarget::Cs2 => self.refresh_cs2_window(),
+        }
         self.poll_hotkeys();
         self.poll_encode_results();
+        self.poll_cs2_results();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        if self.show_preview {
+        // Live preview is only wired for the RuneLite pipeline; the CS2 GPU
+        // path keeps every frame on the GPU and has no preview thumbnails.
+        if self.settings.game_target == GameTarget::RuneLite && self.show_preview {
             if self.capture_handle.is_none() && self.preview_capture.is_none() {
                 self.start_preview_capture();
             }

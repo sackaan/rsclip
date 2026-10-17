@@ -204,6 +204,11 @@ fn process_frame(
     staging_cache: &Mutex<Option<(ID3D11Texture2D, u32, u32)>>,
     dropped_frames: &Arc<AtomicU64>,
 ) -> Result<()> {
+    // This path does a GPU→CPU readback, so `CaptureToSubmit` here measures
+    // the map/copy cost that the CS2 GPU path avoids entirely.
+    let captured = crate::metrics::Timestamp::now();
+    crate::metrics::note_capture(captured);
+
     let surface = frame.Surface()?;
     let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
     let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
@@ -287,6 +292,12 @@ fn process_frame(
         .is_err()
     {
         dropped_frames.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::mark_dropped();
+    } else {
+        crate::metrics::record_since(crate::metrics::Stage::CaptureToSubmit, captured);
+        // Counted at handoff rather than at buffer insert: this path buffers
+        // opaque MPEG-TS chunks, so there is no per-frame insert downstream.
+        crate::metrics::mark_frame();
     }
 
     Ok(())

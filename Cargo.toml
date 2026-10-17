@@ -9,6 +9,13 @@ readme = "README.md"
 keywords = ["osrs", "runelite", "replay", "screen-capture", "windows"]
 categories = ["multimedia::video", "games"]
 
+[features]
+default = []
+# Performance instrumentation: counting global allocator, per-stage latency
+# histograms, and a process CPU/memory sampler. Off by default so shipped
+# builds carry no measurement overhead. See `src/metrics/mod.rs`.
+metrics = ["dep:hdrhistogram"]
+
 [dependencies]
 # GUI
 eframe = { version = "0.31", features = ["persistence"] }
@@ -39,10 +46,14 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_WinRT_Direct3D11",
     "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
     "Win32_System_Com",
     "Win32_Graphics_Dwm",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
 ] }
 
 # Concurrency
@@ -73,7 +84,15 @@ dirs = "6"
 # Native file dialog
 rfd = "0.15"
 
+# Latency histograms (only pulled in by the `metrics` feature)
+hdrhistogram = { version = "7", default-features = false, optional = true }
+
 [build-dependencies]
 winresource = "0.1"
 image = "0.25"
 ico = "0.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1

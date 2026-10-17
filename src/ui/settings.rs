@@ -5,6 +5,38 @@ use crate::utils;
 
 pub const SETTINGS_KEY: &str = "rsclip_settings";
 
+/// Which game the app is currently set up to capture. RuneLite uses the
+/// original CPU-readback + FFmpeg pipeline; CS2 uses the GPU zero-copy
+/// (Media Foundation) pipeline with motion-blur on save.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GameTarget {
+    #[default]
+    RuneLite,
+    Cs2,
+}
+
+impl GameTarget {
+    pub fn label(&self) -> &'static str {
+        match self {
+            GameTarget::RuneLite => "RuneLite",
+            GameTarget::Cs2 => "CS2",
+        }
+    }
+}
+
+/// One user-configured application audio source. Identified by exe basename
+/// so the same configuration survives the process getting restarted with a
+/// new PID.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppChannelConfig {
+    /// Lowercased executable basename (e.g. `"discord.exe"`).
+    pub exe_name: String,
+    /// Friendly label for the UI.
+    pub display_name: String,
+    /// Mix volume (0.0–1.0).
+    pub volume: f32,
+}
+
 /// Struct-level `serde(default)` means any missing field during deserialization
 /// falls back to the value from `Settings::default()`, so we don't need
 /// per-field default functions.
@@ -41,6 +73,26 @@ pub struct Settings {
     pub game_volume: f32,
     /// Microphone volume (0.0–1.0).
     pub mic_volume: f32,
+    /// User-configured application audio sources (Discord, browser, etc.).
+    /// Resolved to live PIDs at recording start via WASAPI session
+    /// enumeration; entries whose exe is not currently running are skipped.
+    pub app_channels: Vec<AppChannelConfig>,
+
+    /// Which game the app is targeting (selects the capture pipeline).
+    pub game_target: GameTarget,
+    /// CS2 real-frame capture rate, in fps. Capped at the monitor refresh by
+    /// Windows Graphics Capture (e.g. 240 on a 240 Hz panel).
+    pub cs2_capture_fps: u32,
+    /// CS2 final output frame rate after the motion-blur blend (e.g. 60).
+    pub cs2_output_fps: u32,
+    /// Whether to apply real-frame motion blur when saving CS2 clips.
+    pub cs2_blur_enabled: bool,
+    /// CS2 blur shutter strength, 0–100 % (100 = blend every frame in the
+    /// interval = 360° shutter).
+    pub cs2_blur_pct: u32,
+    /// Bitrate (kbps) for the CS2 capture-time H.264 encode held in the ring
+    /// buffer. High, since it is the intermediate that the blur re-encodes.
+    pub cs2_bitrate_kbps: u32,
 }
 
 impl Default for Settings {
@@ -67,6 +119,13 @@ impl Default for Settings {
             mic_device_name: String::new(),
             game_volume: 1.0,
             mic_volume: 1.0,
+            app_channels: Vec::new(),
+            game_target: GameTarget::default(),
+            cs2_capture_fps: 240,
+            cs2_output_fps: 60,
+            cs2_blur_enabled: true,
+            cs2_blur_pct: 50,
+            cs2_bitrate_kbps: 50_000,
         }
     }
 }

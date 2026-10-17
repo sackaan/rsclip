@@ -19,11 +19,26 @@
 mod capture;
 mod encoding;
 mod logging;
+mod metrics;
 mod platform;
 mod ui;
 mod utils;
 
 use eframe::egui;
+
+/// Count every heap allocation so the capture hot path can be shown to be
+/// allocation-free in steady state. Only installed for instrumented builds
+/// (`--features metrics`); the default build uses the system allocator
+/// untouched.
+#[cfg(feature = "metrics")]
+#[global_allocator]
+static ALLOCATOR: metrics::alloc::Counting = metrics::alloc::Counting;
+
+/// How often the instrumented build samples CPU, memory, and allocation
+/// counters. Long enough that the sampler itself is invisible, short enough to
+/// see a warm-up curve.
+#[cfg(feature = "metrics")]
+const METRICS_INTERVAL_SECS: u64 = 10;
 
 /// Decode the embedded PNG icon into an `egui` icon data buffer for the
 /// title bar.
@@ -41,6 +56,11 @@ fn load_icon() -> Option<egui::IconData> {
 fn main() -> eframe::Result<()> {
     logging::init_gui_logger(log::LevelFilter::Info);
     log::info!("RSClip starting");
+
+    // Held for the lifetime of the process; the summary dump is written when
+    // it drops after the event loop returns.
+    #[cfg(feature = "metrics")]
+    let _reporter = metrics::report::start(METRICS_INTERVAL_SECS);
 
     if let Err(e) = utils::ensure_clips_dir(&utils::default_clips_dir()) {
         log::warn!("Could not create clips directory: {}", e);

@@ -26,6 +26,8 @@ fn wav_duration_secs(wav: &[u8]) -> f64 {
 }
 
 pub(crate) fn remux_to_mp4(request: &SaveRequest) -> anyhow::Result<String> {
+    // The remux-vs-re-encode comparison lives or dies on this number.
+    let _export = crate::metrics::Timer::start(crate::metrics::Stage::Export);
     utils::ensure_clips_dir(&request.output_dir)?;
 
     let filename = utils::clip_filename();
