@@ -32,7 +32,11 @@ pub(crate) struct SaveRequest {
     pub encoded_data: Vec<u8>,
     pub output_dir: String,
     pub audio_wav: Option<Vec<u8>>,
+    /// Wall-clock span the video shows.
     pub video_duration_secs: f64,
+    /// Factor applied to the video's timestamps so it plays over
+    /// `video_duration_secs`; 1.0 leaves them as encoded.
+    pub video_time_scale: f64,
     pub audio_bitrate_kbps: u32,
 }
 

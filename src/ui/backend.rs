@@ -433,6 +433,12 @@ impl ClipperApp {
         let Some(enc) = self.live_encoder.as_ref() else {
             return;
         };
+        if enc.take_overload_notice() {
+            self.status_msg = StatusMessage::warning(format!(
+                "Encoder can't keep up at {} fps — try a faster preset or lower fps",
+                self.settings.fps
+            ));
+        }
         if !enc.has_failed() {
             return;
         }

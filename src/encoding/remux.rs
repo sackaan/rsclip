@@ -63,10 +63,13 @@ pub(crate) fn remux_to_mp4(request: &SaveRequest) -> anyhow::Result<String> {
     };
 
     let mut cmd = ffmpeg_cmd();
-    cmd.arg("-y")
-        .args(["-fflags", "+genpts"])
-        .arg("-i")
-        .arg(&temp_path);
+    cmd.arg("-y").args(["-fflags", "+genpts"]);
+    // If the encoder fell behind real time the stream is shorter than the
+    // moments it shows; stretch it back so it stays in step with the audio.
+    if request.video_time_scale != 1.0 {
+        cmd.args(["-itsscale", &format!("{:.6}", request.video_time_scale)]);
+    }
+    cmd.arg("-i").arg(&temp_path);
 
     if has_audio {
         let audio_secs = wav_duration_secs(request.audio_wav.as_deref().unwrap_or(&[]));
@@ -212,6 +215,7 @@ mod tests {
             output_dir: out_dir.to_string_lossy().into_owned(),
             audio_wav: None,
             video_duration_secs: 2.0,
+            video_time_scale: 1.0,
             audio_bitrate_kbps: 128,
         };
         remux_to_mp4(&request).expect("first save");
@@ -223,6 +227,57 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
         assert!(names.iter().all(|n| n.ends_with(".mp4")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clip from an encoder that fell behind real time is stretched to
+    /// the wall-clock span it shows, still without re-encoding. Needs
+    /// FFmpeg: `cargo test -- --ignored remux`.
+    #[test]
+    #[ignore]
+    fn remux_retimes_video_to_wall_clock_span() {
+        let dir = std::env::temp_dir().join(format!("rsclip_retime_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts = dir.join("src.ts");
+        let ok = ffmpeg_cmd()
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc2=s=320x240:r=30")
+            .args(["-t", "2", "-c:v", "libx264", "-g", "30", "-f", "mpegts"])
+            .arg(&ts)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "ffmpeg available");
+
+        let out_dir = dir.join("clips");
+        let request = SaveRequest {
+            encoded_data: std::fs::read(&ts).unwrap(),
+            output_dir: out_dir.to_string_lossy().into_owned(),
+            audio_wav: None,
+            video_duration_secs: 3.0,
+            video_time_scale: 1.5,
+            audio_bitrate_kbps: 128,
+        };
+        remux_to_mp4(&request).expect("save");
+
+        let clip = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let probe = ffmpeg_cmd().arg("-i").arg(&clip).output().unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        let dur = info
+            .split("Duration: ")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .expect("duration in ffmpeg output");
+        let secs: f64 = dur.split(':').fold(0.0, |acc, part| {
+            acc * 60.0 + part.trim().parse::<f64>().unwrap()
+        });
+        assert!((secs - 3.0).abs() < 0.1, "clip lasts {secs}s, expected ~3s");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

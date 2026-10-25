@@ -5,16 +5,17 @@
 //! [`SaveRequest`] that is remuxed to MP4 (stream copy — no re-encode), with
 //! the mixed audio muxed in.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use log::{info, warn};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::encoding::buffer::{EncodedReplayBuffer, SharedEncodedBuffer, PTS_HZ};
 use crate::encoding::config::EncoderConfig;
@@ -27,6 +28,23 @@ pub use super::types::{build_preview_frame, RawFrame, SharedPreviewFrame};
 
 /// Spare frame buffers kept for reuse by the capture side.
 const RECYCLE_DEPTH: usize = 4;
+
+/// A frame written up to this late is stamped with its scheduled time, so
+/// OS timer jitter doesn't disturb the exact frame cadence.
+const WRITE_JITTER: Duration = Duration::from_millis(20);
+
+/// Falling further behind schedule than this means FFmpeg can't encode in
+/// real time. The writer then resyncs to now instead of bursting repeated
+/// frames to catch up, and frames are stamped with when they were written.
+const MAX_WRITE_LAG: Duration = Duration::from_millis(100);
+
+/// How long frame write times are kept: the longest buffer the settings
+/// allow (300 s) plus a GOP and the encoder's latency.
+const CLOCK_HISTORY_SECS: u64 = 330;
+
+/// Above this relative difference between a clip's wall-clock span and its
+/// encoded duration, the remux retimes the video to the wall-clock span.
+const RETIME_TOLERANCE: f64 = 0.001;
 
 /// Manages a persistent FFmpeg process for real-time H.264 encoding.
 ///
@@ -47,6 +65,11 @@ pub struct LiveEncoder {
     running: Arc<AtomicBool>,
     /// Set when FFmpeg dies or its pipes break while still running.
     failed: Arc<AtomicBool>,
+    /// Set by the writer when FFmpeg falls behind real time.
+    overloaded: Arc<AtomicBool>,
+    /// Whether [`take_overload_notice`](LiveEncoder::take_overload_notice)
+    /// has already reported an overload.
+    overload_noticed: AtomicBool,
     /// Audio bitrate for AAC encoding during remux.
     audio_bitrate_kbps: u32,
     /// Which encoder backend is active.
@@ -55,9 +78,8 @@ pub struct LiveEncoder {
     frame_size: (u32, u32),
     /// Output frame rate (constant).
     fps: u32,
-    /// Origin of the writer's frame clock, set when the first frame is
-    /// written: frame `n` is written at `writer_start + n / fps`.
-    writer_start: Arc<OnceLock<Instant>>,
+    /// When each frame number was written to FFmpeg.
+    frame_clock: SharedFrameClock,
 }
 
 /// Encoded video taken for a save, with the wall-clock interval it shows.
@@ -68,12 +90,58 @@ pub(crate) struct VideoSnapshot {
     pub start: Instant,
     /// When the last frame stops being displayed.
     pub end: Instant,
+    /// Duration of the encoded stream (frame count / fps). Differs from
+    /// the wall-clock span when FFmpeg couldn't keep up.
+    pub stream_secs: f64,
 }
 
 impl VideoSnapshot {
     /// Length of the clip in seconds.
     pub fn duration_secs(&self) -> f64 {
         (self.end - self.start).as_secs_f64()
+    }
+
+    /// Factor that stretches the encoded stream onto the wall-clock span it
+    /// shows, or 1.0 when they already agree.
+    pub fn time_scale(&self) -> f64 {
+        if self.stream_secs <= 0.0 {
+            return 1.0;
+        }
+        let scale = self.duration_secs() / self.stream_secs;
+        if (scale - 1.0).abs() > RETIME_TOLERANCE {
+            scale
+        } else {
+            1.0
+        }
+    }
+}
+
+/// When each frame number was written to FFmpeg. The encoder stamps frame
+/// `n` with PTS `n / fps`; this maps it back to the moment it shows.
+#[derive(Default)]
+struct FrameClock {
+    /// Frame number of `times[0]`.
+    first: u64,
+    times: VecDeque<Instant>,
+}
+
+type SharedFrameClock = Arc<Mutex<FrameClock>>;
+
+impl FrameClock {
+    /// Record the next frame's time, keeping at most `keep` entries.
+    fn push(&mut self, at: Instant, keep: usize) {
+        self.times.push_back(at);
+        while self.times.len() > keep.max(1) {
+            self.times.pop_front();
+            self.first += 1;
+        }
+    }
+
+    /// Time of frame `n`, clamped to the frames still on record.
+    fn at(&self, n: u64) -> Option<Instant> {
+        let last = self.times.len().checked_sub(1)?;
+        let i = n.saturating_sub(self.first).min(last as u64) as usize;
+        Some(self.times[i])
     }
 }
 
@@ -107,10 +175,9 @@ impl LiveEncoder {
         let preview_frame: SharedPreviewFrame = Arc::new(parking_lot::Mutex::new(None));
 
         let fps = cfg.fps;
-        let writer_start = Arc::new(OnceLock::new());
-        let writer_start_w = writer_start.clone();
+        let overloaded = Arc::new(AtomicBool::new(false));
+        let frame_clock: SharedFrameClock = Arc::default();
         let audio_bitrate_kbps = cfg.audio_bitrate_kbps;
-        let frame_len = enc_width as usize * enc_height as usize * 4;
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<RawFrame>(2);
         let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(RECYCLE_DEPTH);
@@ -154,90 +221,22 @@ impl LiveEncoder {
             })?;
 
         // Writer thread: clock-disciplined pacing to maintain constant frame rate.
-        let running_w = running.clone();
-        let failed_w = failed.clone();
-        let preview_clone = preview_frame.clone();
+        let writer = FrameWriter {
+            frame_rx,
+            recycle_tx,
+            preview: preview_frame.clone(),
+            running: running.clone(),
+            failed: failed.clone(),
+            overloaded: overloaded.clone(),
+            clock: frame_clock.clone(),
+            frame_size: (enc_width, enc_height),
+            fps,
+        };
         std::thread::Builder::new()
             .name("encoder-writer".into())
             .spawn(move || {
                 let mut stdin = stdin;
-                let mut last_preview = Instant::now();
-                let mut last_frame_data: Option<Vec<u8>> = None;
-                // The frame clock starts when the first frame is written, so
-                // frame numbers (and therefore encoder PTS) map exactly onto
-                // wall time: frame `n` goes out at `start_time + n / fps`.
-                let mut start_time: Option<Instant> = None;
-                let mut frames_written: u64 = 0;
-
-                loop {
-                    if !running_w.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let got_frame = match start_time {
-                        // Nothing to pace (or repeat) until the first frame.
-                        None => match frame_rx.recv_timeout(Duration::from_millis(100)) {
-                            Ok(raw_frame) => Some(raw_frame),
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                        },
-                        Some(start) => {
-                            let next_deadline = start
-                                + Duration::from_nanos(frames_written * 1_000_000_000 / fps as u64);
-                            let wait = next_deadline.saturating_duration_since(Instant::now());
-                            if wait > Duration::ZERO {
-                                match frame_rx.recv_timeout(wait) {
-                                    Ok(raw_frame) => Some(raw_frame),
-                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
-                                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                                }
-                            } else {
-                                frame_rx.try_recv().ok()
-                            }
-                        }
-                    };
-
-                    // Every frame — fresh or repeated — is a packed buffer of
-                    // exactly the encoder's size, written in one call.
-                    let data = match got_frame {
-                        Some(raw_frame) => {
-                            if raw_frame.width != enc_width
-                                || raw_frame.height != enc_height
-                                || raw_frame.data.len() != frame_len
-                            {
-                                continue;
-                            }
-                            if last_preview.elapsed() >= Duration::from_millis(250) {
-                                last_preview = Instant::now();
-                                let pf = build_preview_frame(&raw_frame);
-                                *preview_clone.lock() = Some(pf);
-                            }
-                            if let Some(old) = last_frame_data.replace(raw_frame.data) {
-                                let _ = recycle_tx.try_send(old);
-                            }
-                            last_frame_data.as_deref()
-                        }
-                        None => last_frame_data.as_deref(),
-                    };
-
-                    if let Some(data) = data {
-                        if start_time.is_none() {
-                            let now = Instant::now();
-                            start_time = Some(now);
-                            let _ = writer_start_w.set(now);
-                        }
-                        if stdin.write_all(data).is_err() {
-                            if running_w.load(Ordering::Relaxed) {
-                                warn!("FFmpeg stdin write failed — encoder may have crashed");
-                                failed_w.store(true, Ordering::SeqCst);
-                            }
-                            break;
-                        }
-                    }
-
-                    frames_written += 1;
-                }
-
+                writer.run(&mut stdin);
                 drop(stdin);
                 let _ = child.kill();
                 let _ = child.wait();
@@ -289,11 +288,13 @@ impl LiveEncoder {
             preview_frame,
             running,
             failed,
+            overloaded,
+            overload_noticed: AtomicBool::new(false),
             audio_bitrate_kbps,
             hw_encoder,
             frame_size: (enc_width, enc_height),
             fps,
-            writer_start,
+            frame_clock,
         })
     }
 
@@ -377,23 +378,30 @@ impl LiveEncoder {
         self.failed.load(Ordering::SeqCst)
     }
 
+    /// `true` the first time FFmpeg is seen falling behind real time, so
+    /// the UI can warn once per recording.
+    pub fn take_overload_notice(&self) -> bool {
+        self.overloaded.load(Ordering::Relaxed)
+            && !self.overload_noticed.swap(true, Ordering::Relaxed)
+    }
+
     /// Snapshot the encoded buffer together with the wall-clock interval
     /// it covers, so audio can be cut to exactly the same moments. Returns
     /// `None` until the first keyframe has been encoded.
     pub(crate) fn snapshot(&self) -> Option<VideoSnapshot> {
-        let writer_start = *self.writer_start.get()?;
         let snap = self.encoded_buffer.read().snapshot()?;
-        let (start, end) = frame_span_to_wall(
-            writer_start,
+        let span = frame_span(
+            &self.frame_clock.lock(),
             self.fps,
             snap.base_pts,
             snap.start_pts,
             snap.end_pts,
-        );
+        )?;
         Some(VideoSnapshot {
             data: snap.data,
-            start,
-            end,
+            start: span.start,
+            end: span.end,
+            stream_secs: span.stream_secs,
         })
     }
 
@@ -406,6 +414,7 @@ impl LiveEncoder {
     ) -> SaveRequest {
         SaveRequest {
             video_duration_secs: video.duration_secs(),
+            video_time_scale: video.time_scale(),
             encoded_data: video.data,
             output_dir: output_dir.to_string(),
             audio_wav,
@@ -426,27 +435,160 @@ impl Drop for LiveEncoder {
     }
 }
 
+/// Writer-thread state: paces frames into FFmpeg's stdin at a constant
+/// rate, repeating the newest captured frame when no new one arrived.
+struct FrameWriter {
+    frame_rx: Receiver<RawFrame>,
+    recycle_tx: Sender<Vec<u8>>,
+    preview: SharedPreviewFrame,
+    running: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    overloaded: Arc<AtomicBool>,
+    clock: SharedFrameClock,
+    frame_size: (u32, u32),
+    fps: u32,
+}
+
+impl FrameWriter {
+    /// Write frames to `out` until stopped or the pipe breaks.
+    ///
+    /// The encoder numbers frames in the order they are written, so every
+    /// write records the moment that frame shows in [`FrameClock`]. On
+    /// schedule that is the scheduled time, keeping the cadence exact. If
+    /// FFmpeg can't keep up, the writer stamps frames with when they were
+    /// actually written and resyncs instead of bursting repeats; otherwise
+    /// the encoded timeline would drift ever further behind wall time.
+    fn run(self, out: &mut impl Write) {
+        let (width, height) = self.frame_size;
+        let frame_len = width as usize * height as usize * 4;
+        let fps = self.fps.max(1);
+        let period = Duration::from_nanos(1_000_000_000 / fps as u64);
+        let keep = (CLOCK_HISTORY_SECS * fps as u64) as usize;
+        let mut last_preview = Instant::now();
+        let mut last_frame_data: Option<Vec<u8>> = None;
+        // When the next frame is due; `None` until the first frame.
+        let mut next_due: Option<Instant> = None;
+
+        loop {
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let got_frame = match next_due {
+                // Nothing to pace (or repeat) until the first frame.
+                None => match self.frame_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(raw_frame) => Some(raw_frame),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                },
+                Some(due) => {
+                    let wait = due.saturating_duration_since(Instant::now());
+                    if wait > Duration::ZERO {
+                        match self.frame_rx.recv_timeout(wait) {
+                            Ok(raw_frame) => Some(raw_frame),
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        self.frame_rx.try_recv().ok()
+                    }
+                }
+            };
+
+            // Every frame — fresh or repeated — is a packed buffer of
+            // exactly the encoder's size, written in one call.
+            let data = match got_frame {
+                Some(raw_frame) => {
+                    if raw_frame.width != width
+                        || raw_frame.height != height
+                        || raw_frame.data.len() != frame_len
+                    {
+                        continue;
+                    }
+                    if last_preview.elapsed() >= Duration::from_millis(250) {
+                        last_preview = Instant::now();
+                        let pf = build_preview_frame(&raw_frame);
+                        *self.preview.lock() = Some(pf);
+                    }
+                    if let Some(old) = last_frame_data.replace(raw_frame.data) {
+                        let _ = self.recycle_tx.try_send(old);
+                    }
+                    last_frame_data.as_deref()
+                }
+                None => last_frame_data.as_deref(),
+            };
+            let Some(data) = data else {
+                continue;
+            };
+
+            let now = Instant::now();
+            let due = next_due.unwrap_or(now);
+            let shown_at = if now.saturating_duration_since(due) <= WRITE_JITTER {
+                due
+            } else {
+                now
+            };
+            self.clock.lock().push(shown_at, keep);
+
+            if out.write_all(data).is_err() {
+                if self.running.load(Ordering::Relaxed) {
+                    warn!("FFmpeg stdin write failed — encoder may have crashed");
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+                break;
+            }
+
+            let after = Instant::now();
+            let following = due + period;
+            next_due = Some(
+                if after.saturating_duration_since(following) > MAX_WRITE_LAG {
+                    if !self.overloaded.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            "Encoder can't keep up with {} fps; clips are retimed to real time",
+                            fps
+                        );
+                    }
+                    after
+                } else {
+                    following
+                },
+            );
+        }
+    }
+}
+
+/// Wall-clock interval shown by a run of buffered frames.
+struct FrameSpan {
+    start: Instant,
+    end: Instant,
+    /// Duration of those frames in the encoded stream.
+    stream_secs: f64,
+}
+
 /// Map the PTS range of buffered frames to the wall-clock interval they
-/// show. The writer emits frame `n` at `writer_start + n / fps` carrying
-/// the newest captured image, and the encoder stamps it
-/// `base_pts + n * 90000 / fps`; the last frame stays on screen for one
-/// more frame period.
-fn frame_span_to_wall(
-    writer_start: Instant,
+/// show. The encoder stamps frame `n` with `base_pts + n * 90000 / fps`;
+/// `clock` says when frame `n` was written. The last frame stays on screen
+/// for one more frame period. `None` if no frame has been written.
+fn frame_span(
+    clock: &FrameClock,
     fps: u32,
     base_pts: i64,
     start_pts: i64,
     end_pts: i64,
-) -> (Instant, Instant) {
+) -> Option<FrameSpan> {
     let fps = fps.max(1) as f64;
-    let at = |pts: i64| {
-        let frame = ((pts - base_pts) as f64 * fps / PTS_HZ as f64)
+    let frame = |pts: i64| {
+        ((pts - base_pts) as f64 * fps / PTS_HZ as f64)
             .round()
-            .max(0.0);
-        writer_start + Duration::from_secs_f64(frame / fps)
+            .max(0.0) as u64
     };
-    let end = at(end_pts) + Duration::from_secs_f64(1.0 / fps);
-    (at(start_pts), end)
+    let (first, last) = (frame(start_pts), frame(end_pts).max(frame(start_pts)));
+    let period = Duration::from_secs_f64(1.0 / fps);
+    Some(FrameSpan {
+        start: clock.at(first)?,
+        end: clock.at(last)? + period,
+        stream_secs: (last + 1 - first) as f64 / fps,
+    })
 }
 
 /// Colour conversion applied to every frame: BGRA is converted to
@@ -495,17 +637,183 @@ mod tests {
         }
     }
 
+    /// A clock with frame `n` written at `t0 + n * spacing`.
+    fn clock_with_spacing(t0: Instant, frames: u64, spacing: Duration) -> FrameClock {
+        let mut clock = FrameClock::default();
+        for n in 0..frames {
+            clock.push(t0 + spacing * n as u32, usize::MAX);
+        }
+        clock
+    }
+
     #[test]
-    fn frame_span_maps_pts_to_writer_clock() {
+    fn frame_span_maps_pts_to_write_times() {
         let t0 = Instant::now();
+        let clock = clock_with_spacing(t0, 400, Duration::from_secs(1) / 60);
         // 60 fps: 1500 ticks per frame. Frames 120..=299 buffered.
-        let (start, end) =
-            frame_span_to_wall(t0, 60, 126_000, 126_000 + 120 * 1500, 126_000 + 299 * 1500);
+        let span = frame_span(
+            &clock,
+            60,
+            126_000,
+            126_000 + 120 * 1500,
+            126_000 + 299 * 1500,
+        )
+        .unwrap();
         let ms = |i: Instant| (i - t0).as_secs_f64() * 1000.0;
-        assert!((ms(start) - 2000.0).abs() < 0.01);
-        assert!((ms(end) - 5000.0).abs() < 0.01);
-        // 180 frames -> exactly 3 s of clip.
-        assert!(((end - start).as_secs_f64() - 3.0).abs() < 1e-6);
+        assert!((ms(span.start) - 2000.0).abs() < 0.01);
+        assert!((ms(span.end) - 5000.0).abs() < 0.01);
+        // 180 frames -> exactly 3 s of clip, and no retiming needed.
+        assert!((span.stream_secs - 3.0).abs() < 1e-9);
+        let snap = VideoSnapshot {
+            data: Vec::new(),
+            start: span.start,
+            end: span.end,
+            stream_secs: span.stream_secs,
+        };
+        assert_eq!(snap.time_scale(), 1.0);
+    }
+
+    #[test]
+    fn frame_span_follows_a_writer_that_fell_behind() {
+        // FFmpeg only took a frame every 1.5 periods: 180 frames (3 s of
+        // stream) were written over 4.5 s of wall time.
+        let t0 = Instant::now();
+        let clock = clock_with_spacing(t0, 400, Duration::from_secs(1) / 40);
+        let span = frame_span(&clock, 60, 0, 120 * 1500, 299 * 1500).unwrap();
+        let ms = |i: Instant| (i - t0).as_secs_f64() * 1000.0;
+        assert!((ms(span.start) - 3000.0).abs() < 0.01);
+        assert!((ms(span.end) - (299.0 * 25.0 + 1000.0 / 60.0)).abs() < 0.01);
+        assert!((span.stream_secs - 3.0).abs() < 1e-9);
+        let snap = VideoSnapshot {
+            data: Vec::new(),
+            start: span.start,
+            end: span.end,
+            stream_secs: span.stream_secs,
+        };
+        let expected = (179.0 * 25.0 + 1000.0 / 60.0) / 3000.0;
+        assert!((snap.time_scale() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn frame_clock_clamps_to_retained_frames() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::default();
+        assert!(clock.at(0).is_none());
+        for n in 0..10u32 {
+            clock.push(t0 + Duration::from_millis(10) * n, 4);
+        }
+        // Frames 6..=9 are kept.
+        assert_eq!(clock.at(0), Some(t0 + Duration::from_millis(60)));
+        assert_eq!(clock.at(7), Some(t0 + Duration::from_millis(70)));
+        assert_eq!(clock.at(99), Some(t0 + Duration::from_millis(90)));
+    }
+
+    /// Sink that takes `delay` per frame, like an FFmpeg that encodes
+    /// slower than real time, and records when each write began.
+    struct SlowSink {
+        delay: Duration,
+        starts: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl Write for SlowSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.starts.lock().push(Instant::now());
+            std::thread::sleep(self.delay);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Feed frames at `fps` for `run_for` into a writer whose sink takes
+    /// `delay` per frame. Returns the recorded frame times, when each write
+    /// actually began, and whether the writer reported an overload.
+    fn drive_writer(
+        fps: u32,
+        delay: Duration,
+        run_for: Duration,
+    ) -> (Vec<Instant>, Vec<Instant>, bool) {
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
+        let (recycle_tx, _recycle_rx) = crossbeam_channel::bounded(RECYCLE_DEPTH);
+        let running = Arc::new(AtomicBool::new(true));
+        let overloaded = Arc::new(AtomicBool::new(false));
+        let clock: SharedFrameClock = Arc::default();
+        let writer = FrameWriter {
+            frame_rx,
+            recycle_tx,
+            preview: Arc::new(Mutex::new(None)),
+            running: running.clone(),
+            failed: Arc::new(AtomicBool::new(false)),
+            overloaded: overloaded.clone(),
+            clock: clock.clone(),
+            frame_size: (4, 2),
+            fps,
+        };
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = SlowSink {
+            delay,
+            starts: starts.clone(),
+        };
+        let handle = std::thread::spawn(move || writer.run(&mut sink));
+
+        let begin = Instant::now();
+        while begin.elapsed() < run_for {
+            let _ = frame_tx.try_send(RawFrame {
+                data: vec![0; 4 * 2 * 4],
+                width: 4,
+                height: 2,
+            });
+            std::thread::sleep(Duration::from_secs(1) / fps);
+        }
+        running.store(false, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let times = clock.lock().times.iter().copied().collect();
+        let starts = starts.lock().clone();
+        (times, starts, overloaded.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn writer_stamps_frames_with_real_time_when_ffmpeg_is_slow() {
+        // Each write takes 1.5 frame periods. The old writer stamped frame
+        // `n` at `n / fps` regardless, drifting ~0.5 s behind after 1.5 s.
+        let (times, starts, overloaded) =
+            drive_writer(60, Duration::from_millis(25), Duration::from_millis(1500));
+        assert!(overloaded, "a writer that can't keep up must say so");
+        assert_eq!(times.len(), starts.len());
+        assert!(times.len() > 30, "only {} frames written", times.len());
+        let worst = times
+            .iter()
+            .zip(&starts)
+            .map(|(t, s)| {
+                s.saturating_duration_since(*t)
+                    .max(t.saturating_duration_since(*s))
+            })
+            .max()
+            .unwrap();
+        assert!(
+            worst <= WRITE_JITTER + Duration::from_millis(5),
+            "frame time off by {worst:?}"
+        );
+    }
+
+    #[test]
+    fn writer_keeps_exact_cadence_when_on_time() {
+        let (times, _, overloaded) = drive_writer(60, Duration::ZERO, Duration::from_millis(500));
+        assert!(times.len() > 10);
+        // A heavily loaded machine may legitimately stall the writer; only
+        // check the cadence when it stayed on schedule.
+        if !overloaded {
+            let period = Duration::from_nanos(1_000_000_000 / 60);
+            let exact = times.windows(2).filter(|w| w[1] - w[0] == period).count();
+            assert!(
+                exact * 10 >= (times.len() - 1) * 9,
+                "{exact} of {} intervals on cadence",
+                times.len() - 1
+            );
+        }
     }
 
     #[test]
@@ -622,5 +930,60 @@ mod tests {
         // and its wall span must match the frames it holds.
         let d = snap.duration_secs();
         assert!(d > 0.5 && d < 3.0, "span {d}");
+    }
+
+    /// libx264 `slower` at 1440p60 can't encode in real time on most
+    /// machines. The saved span must still follow wall time instead of
+    /// drifting behind it (the old frame clock lost ~10 s in 20 s here).
+    /// Opt-in: `cargo test --release -- --ignored overloaded_encoder`.
+    #[test]
+    #[ignore]
+    fn overloaded_encoder_snapshot_follows_wall_time() {
+        let (w, h) = (2560u32, 1440u32);
+        let mut c = cfg(w, h);
+        c.width = w;
+        c.height = h;
+        c.x264_preset = X264Preset::Slower;
+        let enc = LiveEncoder::start_with(c, HwEncoder::Software).unwrap();
+        let tx = enc.frame_sender();
+        let begin = Instant::now();
+        let mut i = 0u8;
+        while begin.elapsed() < Duration::from_secs(20) {
+            // Changing content so x264 does real work.
+            let mut data = vec![0u8; (w * h * 4) as usize];
+            for (k, b) in data.iter_mut().enumerate().step_by(97) {
+                *b = (k as u8).wrapping_add(i);
+            }
+            let _ = tx.try_send(RawFrame {
+                data,
+                width: w,
+                height: h,
+            });
+            i = i.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        if !enc.take_overload_notice() {
+            eprintln!("skipped: libx264 kept up on this machine");
+            return;
+        }
+        let snap = enc.snapshot().expect("buffered output");
+        let start_off = snap.start.saturating_duration_since(begin);
+        let end_lag = Instant::now().saturating_duration_since(snap.end);
+        eprintln!(
+            "span {:.2}s wall / {:.2}s stream, start +{:.2}s, end lags {:.2}s",
+            snap.duration_secs(),
+            snap.stream_secs,
+            start_off.as_secs_f64(),
+            end_lag.as_secs_f64()
+        );
+        enc.stop();
+        assert!(
+            start_off < Duration::from_millis(500),
+            "start {start_off:?}"
+        );
+        assert!(snap.time_scale() > 1.2, "scale {}", snap.time_scale());
+        // Only the encoder's own latency separates the newest encoded
+        // frame from now.
+        assert!(end_lag < Duration::from_secs(6), "end lags {end_lag:?}");
     }
 }
