@@ -58,11 +58,16 @@ fn matches_aspect(w: u32, h: u32, num: u32, den: u32) -> bool {
     w * den == h * num
 }
 
+/// Keep the last `max_len` characters of `path`, prefixed with "…" when it
+/// is longer. Counts characters, not bytes, so non-ASCII names (e.g. a
+/// localized mic name) are never cut inside a character.
 fn abbreviate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
+    let len = path.chars().count();
+    if len <= max_len {
         path.to_string()
     } else {
-        format!("…{}", &path[path.len() - max_len..])
+        let tail: String = path.chars().skip(len - max_len).collect();
+        format!("…{tail}")
     }
 }
 
@@ -926,5 +931,28 @@ mod tests {
         assert!(result.starts_with('\u{2026}')); // starts with "…"
                                                  // The path portion (after "…") should be exactly max_len chars
         assert_eq!(result.chars().count(), 21); // 1 ellipsis + 20 path chars
+    }
+
+    #[test]
+    fn test_abbreviate_path_non_ascii_never_splits_a_char() {
+        // Russian Windows' default mic name: a byte-offset cut at 28 lands
+        // inside 'р' and used to panic the UI thread.
+        let mic = "Микрофон (Realtek(R) Audio)";
+        assert_eq!(abbreviate_path(mic, 28), mic);
+        assert_eq!(abbreviate_path(mic, 20), "…н (Realtek(R) Audio)");
+
+        for s in [
+            mic,
+            "C:\\Users\\Kağan\\Videos\\RSClips\\Ölümler",
+            "D:\\動画\\クリップ\\RSClips",
+        ] {
+            for max in 0..=s.chars().count() + 1 {
+                let r = abbreviate_path(s, max);
+                let expected = s.chars().count().min(max);
+                let tail = r.strip_prefix('…').unwrap_or(&r);
+                assert_eq!(tail.chars().count(), expected, "{s:?} max={max}");
+                assert!(s.ends_with(tail));
+            }
+        }
     }
 }
