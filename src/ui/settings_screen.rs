@@ -3,7 +3,7 @@ use eframe::egui;
 use log::warn;
 
 use super::app::ClipperApp;
-use super::settings::{AppChannelConfig, GameTarget};
+use super::settings::AppChannelConfig;
 use super::theme;
 use crate::capture::audio;
 use crate::capture::sessions;
@@ -165,7 +165,6 @@ impl ClipperApp {
                 ui.spacing_mut().interact_size.y = 16.0;
                 ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
 
-                self.section_game(ui);
                 self.section_general(ui);
                 self.section_audio(ui);
                 self.section_encoding(ui);
@@ -519,11 +518,7 @@ impl ClipperApp {
     }
 
     fn refresh_app_audio_sessions(&mut self) {
-        let game_pid = match self.settings.game_target {
-            GameTarget::RuneLite => self.active_window.as_ref().map(|w| w.pid),
-            GameTarget::Cs2 => self.cs2_window.as_ref().map(|w| w.pid),
-        }
-        .unwrap_or(0);
+        let game_pid = self.active_window.as_ref().map_or(0, |w| w.pid);
         match sessions::enumerate_audio_sessions(&[game_pid]) {
             Ok(s) => self.app_audio_sessions = s,
             Err(e) => warn!("Audio session enumeration failed: {}", e),
@@ -541,141 +536,6 @@ impl ClipperApp {
                 warn!("Failed to start app channel {}: {}", sess.display_name, e);
             }
         }
-    }
-
-    fn section_game(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Game", true, |ui| {
-            // ---- target game (selects the capture pipeline) ----
-            ui.label(
-                egui::RichText::new("target")
-                    .size(12.0)
-                    .color(theme::white()),
-            );
-            let prev = self.settings.game_target;
-            ui.horizontal(|ui| {
-                for target in [GameTarget::RuneLite, GameTarget::Cs2] {
-                    ui.selectable_value(
-                        &mut self.settings.game_target,
-                        target,
-                        egui::RichText::new(target.label()).size(10.0),
-                    );
-                }
-            });
-            ui.end_row();
-
-            if self.settings.game_target != prev {
-                // Switching pipelines: stop whatever was running on the old one.
-                self.stop_any_recording();
-            }
-
-            if self.settings.game_target == GameTarget::Cs2 {
-                self.cs2_settings_rows(ui);
-            }
-        });
-    }
-
-    /// CS2-only controls (capture fps, blur, intermediate bitrate). Called
-    /// inside the Game grid, so every row ends with `ui.end_row()`.
-    fn cs2_settings_rows(&mut self, ui: &mut egui::Ui) {
-        // ---- capture fps (capped at monitor refresh by WGC) ----
-        ui.label(
-            egui::RichText::new("capture fps")
-                .size(12.0)
-                .color(theme::white()),
-        );
-        ui.horizontal(|ui| {
-            let mut fps = self.settings.cs2_capture_fps;
-            if ui
-                .add(egui::DragValue::new(&mut fps).range(60..=360).speed(1))
-                .changed()
-            {
-                self.settings.cs2_capture_fps = fps;
-            }
-            ui.colored_label(theme::dim(), egui::RichText::new("≤ monitor Hz").size(9.0));
-        });
-        ui.end_row();
-
-        // ---- output fps ----
-        ui.label(
-            egui::RichText::new("output fps")
-                .size(12.0)
-                .color(theme::white()),
-        );
-        let mut out_fps = self.settings.cs2_output_fps;
-        if ui
-            .add(egui::DragValue::new(&mut out_fps).range(24..=120).speed(1))
-            .changed()
-        {
-            self.settings.cs2_output_fps = out_fps;
-        }
-        ui.end_row();
-
-        // ---- motion blur toggle ----
-        ui.label(
-            egui::RichText::new("motion blur")
-                .size(12.0)
-                .color(theme::white()),
-        );
-        ui.checkbox(
-            &mut self.settings.cs2_blur_enabled,
-            egui::RichText::new("blend real frames").size(10.0),
-        );
-        ui.end_row();
-
-        // ---- blur strength (shutter) ----
-        if self.settings.cs2_blur_enabled {
-            ui.label(
-                egui::RichText::new("blur strength")
-                    .size(12.0)
-                    .color(theme::white()),
-            );
-            ui.horizontal(|ui| {
-                let mut pct = self.settings.cs2_blur_pct;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut pct, 0..=100)
-                            .text("")
-                            .custom_formatter(|v, _| format!("{}%", v as u32))
-                            .clamping(egui::SliderClamping::Always),
-                    )
-                    .changed()
-                {
-                    self.settings.cs2_blur_pct = pct;
-                }
-                ui.colored_label(
-                    theme::dim(),
-                    egui::RichText::new(if pct >= 100 {
-                        "360° shutter"
-                    } else if pct >= 50 {
-                        "cinematic"
-                    } else {
-                        "subtle"
-                    })
-                    .size(9.0),
-                );
-            });
-            ui.end_row();
-        }
-
-        // ---- capture (intermediate) bitrate ----
-        ui.label(
-            egui::RichText::new("capture bitrate")
-                .size(12.0)
-                .color(theme::white()),
-        );
-        let mut br = self.settings.cs2_bitrate_kbps;
-        if ui
-            .add(
-                egui::DragValue::new(&mut br)
-                    .range(5_000..=150_000)
-                    .speed(500)
-                    .suffix(" kbps"),
-            )
-            .changed()
-        {
-            self.settings.cs2_bitrate_kbps = br;
-        }
-        ui.end_row();
     }
 
     fn section_general(&mut self, ui: &mut egui::Ui) {

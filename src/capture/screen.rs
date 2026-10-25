@@ -295,7 +295,7 @@ fn process_frame(
     dropped_frames: &AtomicU64,
 ) -> Result<()> {
     // This path does a GPU→CPU readback, so `CaptureToSubmit` here measures
-    // the map/copy cost that the CS2 GPU path avoids entirely.
+    // the map/copy cost.
     let captured = crate::metrics::Timestamp::now();
     crate::metrics::note_capture(captured);
 

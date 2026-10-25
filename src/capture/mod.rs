@@ -8,7 +8,6 @@
 //!   stateful resampler used for microphone input.
 
 pub mod audio;
-pub mod cs2_capture;
 pub mod screen;
 pub mod sessions;
 mod wasapi;

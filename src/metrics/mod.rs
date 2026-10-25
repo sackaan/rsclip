@@ -42,18 +42,12 @@ use std::sync::atomic::Ordering;
 /// instead of being averaged away in an end-to-end number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// Capture callback entry until the frame is handed to `ProcessInput`.
-    /// Covers the GPU copy, the channel hop, and encoder-thread wakeup.
+    /// Capture callback entry until the frame is handed to the encoder
+    /// channel. Covers the GPU readback and the copy into the frame buffer.
     CaptureToSubmit,
-    /// `ProcessInput` until the matching access unit comes back out of the
-    /// hardware MFT. This is encoder pipeline depth, not just encode work.
-    Encode,
-    /// [`crate::encoding::gpu_buffer::EncodedAuBuffer::push`] — ring insert
-    /// plus GOP trim, under the buffer lock.
+    /// [`crate::encoding::buffer::EncodedReplayBuffer::push`] — ring insert
+    /// plus GOP eviction, under the buffer lock.
     BufferPush,
-    /// Capture callback entry until the access unit is resident in the ring
-    /// buffer. The number that answers "how stale is my replay buffer?".
-    EndToEnd,
     /// Wall-clock gap between consecutive captured frames. Its spread is
     /// capture jitter; compare against 1/fps.
     FrameInterval,
@@ -63,15 +57,13 @@ pub enum Stage {
 
 impl Stage {
     /// Number of distinct stages (histogram array length).
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 4;
 
     /// Short identifier used as a CSV column prefix and log label.
     pub fn name(self) -> &'static str {
         match self {
             Stage::CaptureToSubmit => "capture_to_submit",
-            Stage::Encode => "encode",
             Stage::BufferPush => "buffer_push",
-            Stage::EndToEnd => "end_to_end",
             Stage::FrameInterval => "frame_interval",
             Stage::Export => "export",
         }
@@ -80,9 +72,7 @@ impl Stage {
     /// Every stage, in histogram-index order.
     pub const ALL: [Stage; Stage::COUNT] = [
         Stage::CaptureToSubmit,
-        Stage::Encode,
         Stage::BufferPush,
-        Stage::EndToEnd,
         Stage::FrameInterval,
         Stage::Export,
     ];
@@ -232,9 +222,8 @@ pub fn record(stage: Stage, d: std::time::Duration) {
     }
 }
 
-/// Count one frame that made it through the pipeline — buffered as an access
-/// unit on the GPU path, accepted for encoding on the readback path. Drives
-/// the frames/sec and allocations-per-frame columns.
+/// Count one frame that made it through the pipeline (accepted for
+/// encoding). Drives the frames/sec and allocations-per-frame columns.
 #[inline]
 pub fn mark_frame() {
     #[cfg(feature = "metrics")]
@@ -419,9 +408,9 @@ mod tests {
         let _guard = exclusive();
         reset();
         for us in 1..=1000u64 {
-            record(Stage::Encode, Duration::from_micros(us));
+            record(Stage::CaptureToSubmit, Duration::from_micros(us));
         }
-        let s = summary(Stage::Encode);
+        let s = summary(Stage::CaptureToSubmit);
         assert_eq!(s.count, 1000);
         // 3 significant figures, so allow a small bucketing error.
         assert!((s.p50_us as i64 - 500).abs() <= 2, "p50 was {}", s.p50_us);

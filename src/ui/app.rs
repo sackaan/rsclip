@@ -6,18 +6,15 @@ use eframe::egui;
 use log::{error, info, warn};
 
 use crate::capture::audio::{AudioMixer, MicDevice};
-use crate::capture::cs2_capture::Cs2CaptureHandle;
 use crate::capture::screen::CaptureHandle;
 use crate::capture::sessions::AudioSession;
 use crate::encoding::config::EncoderConfig;
 use crate::encoding::encoder::{self, LiveEncoder, SharedPreviewFrame};
-use crate::encoding::gpu_buffer::SharedAuBuffer;
-use crate::platform::cs2::Cs2Window;
 use crate::platform::hotkeys::HotkeyManager;
 use crate::platform::runelite::RuneLiteWindow;
 use crate::utils::{RecordingStatus, StatusMessage};
 
-use super::settings::{GameTarget, Settings, SETTINGS_KEY};
+use super::settings::{Settings, SETTINGS_KEY};
 use super::theme;
 
 const RS_FONT_FAMILY: &str = "RuneScape";
@@ -45,13 +42,9 @@ pub struct ClipperApp {
     pub(super) live_encoder: Option<LiveEncoder>,
     pub(super) audio_mixer: Option<AudioMixer>,
 
-    // --- CS2 GPU capture path (parallel to the RuneLite path above) ---
-    pub(super) cs2_window: Option<Cs2Window>,
-    pub(super) cs2_capture: Option<Cs2CaptureHandle>,
-    pub(super) cs2_buffer: Option<SharedAuBuffer>,
-    /// Channel carrying save results back from background save threads
-    /// (both pipelines). Owned by the app, not an encoder, so a result is
-    /// never lost when the encoder is replaced mid-save.
+    /// Channel carrying save results back from background save threads.
+    /// Owned by the app, not an encoder, so a result is never lost when the
+    /// encoder is replaced mid-save.
     pub(super) save_result_tx: crossbeam_channel::Sender<anyhow::Result<String>>,
     pub(super) save_result_rx: crossbeam_channel::Receiver<anyhow::Result<String>>,
 
@@ -152,9 +145,6 @@ impl ClipperApp {
             capture_handle: None,
             live_encoder: None,
             audio_mixer: None,
-            cs2_window: None,
-            cs2_capture: None,
-            cs2_buffer: None,
             save_result_tx,
             save_result_rx,
             mic_devices: Vec::new(),
@@ -238,18 +228,13 @@ impl eframe::App for ClipperApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        match self.settings.game_target {
-            GameTarget::RuneLite => self.refresh_runelite_window(),
-            GameTarget::Cs2 => self.refresh_cs2_window(),
-        }
+        self.refresh_runelite_window();
         self.poll_hotkeys();
         self.poll_save_results();
         self.check_encoder_health();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        // Live preview is only wired for the RuneLite pipeline; the CS2 GPU
-        // path keeps every frame on the GPU and has no preview thumbnails.
-        if self.settings.game_target == GameTarget::RuneLite && self.show_preview {
+        if self.show_preview {
             if self.capture_handle.is_none() && self.preview_capture.is_none() {
                 self.start_preview_capture();
             }

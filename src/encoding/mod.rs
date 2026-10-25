@@ -15,9 +15,6 @@
 pub mod buffer;
 pub mod config;
 pub mod encoder;
-pub mod gpu_buffer;
-pub mod gpu_encoder;
-pub mod gpu_save;
 pub(crate) mod hw;
 pub(crate) mod remux;
 pub(crate) mod types;

@@ -483,17 +483,6 @@ impl AudioMixer {
         build_wav(&bytes, 48000, 2, 32, true)
     }
 
-    /// Mix the last `seconds` up to now. See [`snapshot_mixed_wav_span`].
-    ///
-    /// [`snapshot_mixed_wav_span`]: AudioMixer::snapshot_mixed_wav_span
-    pub fn snapshot_mixed_wav(&self, seconds: f64) -> Vec<u8> {
-        let now = Instant::now();
-        let start = now
-            .checked_sub(Duration::from_secs_f64(seconds.max(0.0)))
-            .unwrap_or(now);
-        self.snapshot_mixed_wav_span(start, now)
-    }
-
     /// Stop every channel's capture thread. Idempotent.
     pub fn stop(&self) {
         for ch in &self.channels {
