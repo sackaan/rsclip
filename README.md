@@ -1,16 +1,16 @@
 <div align="center">
 
-# RSClip
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/header-dark.png">
+  <img src="docs/header-light.png" alt="RSClip" width="344">
+</picture>
 
 **Instant replay for RuneLite. Always buffering, one hotkey to save, clips written by stream copy with no re-encode.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/sackaan/rsclip/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=build)](https://github.com/sackaan/rsclip/actions/workflows/ci.yml)
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=for-the-badge)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2021-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?style=for-the-badge&logo=windows11&logoColor=white)](#requirements)
-[![Encoder](https://img.shields.io/badge/encode-NVENC%20%7C%20QSV%20%7C%20AMF%20%7C%20x264-76B900?style=for-the-badge)](#hardware-encoding)
-[![Save cost](https://img.shields.io/badge/save-zero%20video%20re--encode-34d399?style=for-the-badge)](#lifecycle)
-[![Overhead](https://img.shields.io/badge/overhead-measured%20p99%20%2F%20p99.9-a78bfa?style=for-the-badge)](#performance)
+[![CI](https://img.shields.io/github/actions/workflow/status/sackaan/rsclip/ci.yml?branch=main&label=build)](https://github.com/sackaan/rsclip/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2021-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?logo=windows11&logoColor=white)](#requirements)
 
 ![Demo](docs/demo.gif)
 
@@ -69,66 +69,10 @@ RSClip is a GUI app and has no command-line flags. Everything is set in the sett
 
 ## Architecture
 
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'fontFamily':'Inter, Segoe UI, sans-serif','lineColor':'#8b949e'}}}%%
-graph LR
-    subgraph CAP["1 · Capture"]
-        direction TB
-        WGC["Windows Graphics Capture<br/>RuneLite HWND"]:::cap
-        GPU["D3D11 GPU crop<br/>to game canvas"]:::cap
-        RB["Staging readback<br/>+ fit to encoder size"]:::cap
-        WGC -->|"FrameArrived"| GPU --> RB
-    end
-
-    subgraph AUD["2 · Audio"]
-        direction TB
-        LB["WASAPI process loopback<br/>RuneLite"]:::aud
-        MIC["Microphone / app sessions"]:::aud
-        AR["Per-source ring buffers<br/>wall-clock anchored"]:::aud
-        LB --> AR
-        MIC --> AR
-    end
-
-    subgraph ENC["3 · Encode"]
-        direction TB
-        Q["Bounded channel<br/>depth 2, recycled buffers"]:::enc
-        W["Writer thread<br/>constant-FPS pacing"]:::enc
-        FF["ffmpeg child process<br/>NVENC · QSV · AMF · x264"]:::enc
-        Q --> W -->|"raw BGRA"| FF
-    end
-
-    subgraph BUF["4 · Buffer"]
-        direction TB
-        R["Reader thread<br/>MPEG-TS re-framing"]:::buf
-        GOP["GOP ring<br/>evicted by video PTS"]:::buf
-        R --> GOP
-    end
-
-    subgraph OUT["5 · Save"]
-        direction TB
-        HK["Global hotkey (F8)"]:::out
-        SW["Save worker"]:::out
-        MP4["MP4<br/>video copied, audio AAC"]:::out
-        HK --> SW --> MP4
-    end
-
-    RB ==>|"RawFrame"| Q
-    FF ==>|"MPEG-TS on stdout"| R
-    GOP -.->|"snapshot + wall-clock span"| SW
-    AR -.->|"mixed WAV for that span"| SW
-
-    classDef cap fill:#0b3d5c,stroke:#38bdf8,color:#e6f6ff,stroke-width:1.5px
-    classDef aud fill:#4a2a00,stroke:#fbbf24,color:#fff4dc,stroke-width:1.5px
-    classDef enc fill:#3b1d6e,stroke:#a78bfa,color:#f1eaff,stroke-width:1.5px
-    classDef buf fill:#0f4a2f,stroke:#34d399,color:#e4fff2,stroke-width:1.5px
-    classDef out fill:#6b1d3a,stroke:#fb7185,color:#ffe9ee,stroke-width:1.5px
-
-    style CAP fill:#06202f,stroke:#38bdf8,stroke-dasharray: 4 3,color:#e6f6ff
-    style AUD fill:#241500,stroke:#fbbf24,stroke-dasharray: 4 3,color:#fff4dc
-    style ENC fill:#1d0f38,stroke:#a78bfa,stroke-dasharray: 4 3,color:#f1eaff
-    style BUF fill:#072a1b,stroke:#34d399,stroke-dasharray: 4 3,color:#e4fff2
-    style OUT fill:#390f20,stroke:#fb7185,stroke-dasharray: 4 3,color:#ffe9ee
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+  <img src="docs/architecture-light.png" alt="RSClip pipeline: Windows Graphics Capture, bounded queue, ffmpeg encoder and GOP ring buffer on the video path; WASAPI audio rings; a save worker that stream-copies video and mixes audio into an MP4">
+</picture>
 
 ### Lifecycle
 
@@ -147,35 +91,7 @@ A single persistent `ffmpeg` process reads raw BGRA from stdin and writes MPEG-T
 **5. Muxing and file I/O** (`src/encoding/buffer.rs`, `remux.rs`)
 A reader thread re-frames FFmpeg's output into 188-byte TS packets and groups them into GOPs that start at a random-access keyframe. Old GOPs are evicted by video PTS. On hotkey, a snapshot of the ring is taken under a short lock and handed to a save worker, so capture keeps running. The worker remuxes to MP4 by stream copy and encodes the mixed audio to AAC. If a clip's wall-clock span differs from its encoded duration by more than 0.1%, the video is retimed to the wall-clock span.
 
-### Static architecture image
-
-To export `docs/architecture.png` from the diagram above, use one of these.
-
-**Fastest.** Copy the Mermaid block (without the fences) into `arch.mmd` and render it:
-
-```bash
-npx -y @mermaid-js/mermaid-cli -i arch.mmd -o docs/architecture.png -b transparent -s 3
-```
-
-**Excalidraw / SVG design spec**
-
-- Canvas 1600×700, dark background `#0d1117`, font Inter or Excalifont, 16 px labels.
-- Five rounded containers, dashed 1.5 px border in the stage colour with a 10% tint fill, 40 px gaps. Four columns left to right, with Audio stacked under Capture in column 1:
-  1. Capture `#38bdf8` (column 1, top, 280×240)
-  2. Audio `#fbbf24` (column 1, bottom, 280×240)
-  3. Encode `#a78bfa` (column 2, 280×520)
-  4. Buffer `#34d399` (column 3, 280×520)
-  5. Save `#fb7185` (column 4, 280×520)
-- Inside each container, stack 3 to 4 solid rounded boxes (radius 10, 1.5 px stroke in the stage colour, 85% dark tint fill, white 14 px text) with the node labels from the Mermaid code.
-- Thick 3 px arrows for the two main data paths: `RawFrame` into Encode and `MPEG-TS` into Buffer. Thin dashed 1.5 px arrows from Buffer and Audio into the Save worker, labelled "snapshot + wall-clock span" and "mixed WAV".
-- A small pill under the Encode container reading `ffmpeg.exe · stdin → stdout`.
-- Title at top left: "RSClip pipeline", 28 px bold, with a grey subtitle "capture to MP4 without re-encoding".
-
-**Napkin.ai / DALL-E prompt**
-
-> Clean, modern software architecture diagram on a dark GitHub-style background. Left-to-right pipeline of five dashed rounded panels coloured sky blue (Capture), amber (Audio), violet (Encode), emerald (Buffer) and rose (Save). Inside each, small labelled rounded boxes: Windows Graphics Capture, GPU crop, readback; WASAPI loopback, ring buffers; bounded queue, writer thread, ffmpeg NVENC/QSV/AMF/x264; MPEG-TS reader, GOP ring buffer; hotkey, save worker, MP4. Thick glowing arrows for video data, thin dashed arrows for audio and snapshots. Flat vector style, no 3D, no photos, crisp sans-serif text, generous spacing, 16:7 aspect ratio.
-
-AI image tools garble text. Prefer the Mermaid or Excalidraw route for anything with labels you need to read.
+The diagram is generated by `scripts/architecture.py` (needs `rsvg-convert`). Edit it there and rerun to update both theme variants.
 
 ## Hardware encoding
 
