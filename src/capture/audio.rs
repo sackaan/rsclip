@@ -143,8 +143,8 @@ impl AudioRingBuffer {
             }
             let fi = (head + cap_frames - back as usize) % cap_frames;
             let bytes = &self.data[fi * block..fi * block + block];
-            for (s, b) in frame.iter_mut().zip(bytes.chunks_exact(4)) {
-                *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            for (s, b) in frame.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *s = f32::from_le_bytes(*b);
             }
         }
         out
@@ -654,8 +654,10 @@ mod tests {
         }
         let wav = mixer.snapshot_mixed_wav_span(t0, t0 + ms(2000));
         let samples: Vec<f32> = wav[44..]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(samples.len(), 96_000 * 2);
         assert_eq!(samples[0], 0.25); // first channel only
@@ -793,8 +795,10 @@ mod tests {
         let bytes = f32_slice_to_bytes(&samples);
         assert_eq!(bytes.len(), 16);
         let round: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(samples, round);
     }

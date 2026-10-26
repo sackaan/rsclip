@@ -287,7 +287,9 @@ fn parse_pat_pmt_pid(payload: &[u8]) -> Option<u16> {
     // Program loop runs from byte 8 to the CRC (last 4 bytes of section).
     let end = (3 + section_len).saturating_sub(4).min(sec.len());
     sec.get(8..end)?
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .find(|e| u16::from_be_bytes([e[0], e[1]]) != 0)
         .map(|e| u16::from_be_bytes([e[2] & 0x1F, e[3]]))
 }
@@ -369,7 +371,9 @@ mod tests {
     }
 
     fn first_video_packet(data: &[u8]) -> &[u8] {
-        data.chunks_exact(TS_PACKET)
+        data.as_chunks::<TS_PACKET>()
+            .0
+            .iter()
             .find(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == VIDEO)
             .unwrap()
     }

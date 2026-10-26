@@ -560,23 +560,23 @@ fn decode_to_f32(data: &[u8], num_frames: u32, src: &SrcFormat) -> Vec<f32> {
     let mut out = Vec::with_capacity(total_samples);
 
     if src.is_float && src.bits_per_sample == 32 {
-        for chunk in data.chunks_exact(4) {
-            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for chunk in data.as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(*chunk));
         }
     } else if !src.is_float && src.bits_per_sample == 16 {
-        for chunk in data.chunks_exact(2) {
-            let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+        for chunk in data.as_chunks::<2>().0 {
+            let s = i16::from_le_bytes(*chunk);
             out.push(s as f32 / 32768.0);
         }
     } else if !src.is_float && src.bits_per_sample == 24 {
-        for chunk in data.chunks_exact(3) {
+        for chunk in data.as_chunks::<3>().0 {
             let s = ((chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16)) << 8
                 >> 8; // sign-extend
             out.push(s as f32 / 8388608.0);
         }
     } else if !src.is_float && src.bits_per_sample == 32 {
-        for chunk in data.chunks_exact(4) {
-            let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in data.as_chunks::<4>().0 {
+            let s = i32::from_le_bytes(*chunk);
             out.push(s as f32 / 2147483648.0);
         }
     } else {

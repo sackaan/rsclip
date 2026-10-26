@@ -14,7 +14,7 @@ impl ClipperApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::bg_widget())
-                    .stroke(egui::Stroke::new(1.0, theme::stroke()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                     .inner_margin(egui::Margin {
                         left: 10,
                         right: 10,
@@ -181,7 +181,7 @@ impl ClipperApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::bg_widget())
-                    .stroke(egui::Stroke::new(1.0, theme::stroke()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                     .inner_margin(egui::Margin::same(8)),
             )
             .show(ctx, |ui| {

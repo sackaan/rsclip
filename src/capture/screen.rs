@@ -479,9 +479,9 @@ fn blit_fit(
     let off_x = (dst_w - fit_w) / 2;
     let off_y = (dst_h - fit_h) / 2;
 
-    for px in dst.chunks_exact_mut(BYTES_PER_PIXEL) {
-        px.copy_from_slice(&[0, 0, 0, 255]);
-    }
+    dst.as_chunks_mut::<BYTES_PER_PIXEL>()
+        .0
+        .fill([0, 0, 0, 255]);
     for dy in 0..fit_h {
         let sy = ry + dy * rh / fit_h;
         let src_row = sy * src_pitch;

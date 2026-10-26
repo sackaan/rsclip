@@ -47,32 +47,32 @@ pub fn apply_theme(ctx: &egui::Context) {
     v.faint_bg_color = bg_widget();
 
     let cr = egui::CornerRadius::same(2);
-    let no_stroke = egui::Stroke::new(1.0, stroke());
+    let no_stroke = egui::Stroke::new(1.0_f32, stroke());
 
     v.widgets.noninteractive.bg_fill = bg_widget();
     v.widgets.noninteractive.bg_stroke = no_stroke;
     v.widgets.noninteractive.corner_radius = cr;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, muted());
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, muted());
 
     v.widgets.inactive.bg_fill = bg_widget();
     v.widgets.inactive.bg_stroke = no_stroke;
     v.widgets.inactive.corner_radius = cr;
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, white());
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, white());
 
     v.widgets.hovered.bg_fill = bg_hover();
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, muted());
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, muted());
     v.widgets.hovered.corner_radius = cr;
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, white());
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, white());
 
     v.widgets.active.bg_fill = bg_active();
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, white());
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, white());
     v.widgets.active.corner_radius = cr;
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, white());
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, white());
 
     v.selection.bg_fill = egui::Color32::from_rgb(50, 50, 50);
-    v.selection.stroke = egui::Stroke::new(1.0, muted());
+    v.selection.stroke = egui::Stroke::new(1.0_f32, muted());
 
-    v.window_stroke = egui::Stroke::new(1.0, stroke());
+    v.window_stroke = egui::Stroke::new(1.0_f32, stroke());
 
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(16.0, 6.0);
